@@ -25,6 +25,7 @@ YOLO 目标检测 HTTP 服务端。
 
 保存内容（--output-dir 下）：
     detections.csv          每帧每个track的检测结果
+    track_frame_ids.csv     每个track出现过的frame索引与frame名称汇总
     raw/rgb/frameXXXX.jpg   原始RGB图（无标注）
     vis/rgb/frameXXXX.jpg   标注后RGB图（需 --save-vis）
     vis/depth/frameXXXX.jpg 标注后深度图（需 --save-vis）
@@ -85,11 +86,18 @@ _csv_writer = None
 _raw_rgb_dir: Path | None = None
 _vis_rgb_dir: Path | None = None
 _vis_depth_dir: Path | None = None
+_latest_objects_lock = threading.Lock()
+_latest_objects: list[dict] = []
+_latest_frame_name: str | None = None
+_latest_frame_idx: int = -1
+_track_frames_lock = threading.Lock()
+_track_frames: dict[int, set[int]] = {}
+_track_frame_names: dict[int, set[str]] = {}
 
 
 # ── 保存模式初始化 ───────────────────────────────────────────────
 def _init_save_mode(out_dir: Path, do_vis: bool) -> None:
-    global _csv_file, _csv_writer, _raw_rgb_dir, _vis_rgb_dir, _vis_depth_dir
+    global _csv_file, _csv_writer, _raw_rgb_dir, _vis_rgb_dir, _vis_depth_dir, _track_frames, _track_frame_names
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,6 +115,10 @@ def _init_save_mode(out_dir: Path, do_vis: bool) -> None:
     ])
     _csv_file.flush()
     print(f"[Server] CSV 保存至: {csv_path}")
+
+    with _track_frames_lock:
+        _track_frames = {}
+        _track_frame_names = {}
 
     # 原始 RGB 图像目录（无标注）
     _raw_rgb_dir = out_dir / "raw" / "rgb"
@@ -128,6 +140,26 @@ def _flush_csv() -> None:
 
 def _close_save_mode() -> None:
     """Server 退出时调用：关闭 CSV，可选生成轨迹图。"""
+    if output_dir is not None:
+        with _track_frames_lock:
+            snapshot = {tid: sorted(list(frames)) for tid, frames in _track_frames.items()}
+            snapshot_names = {tid: sorted(list(names)) for tid, names in _track_frame_names.items()}
+        if snapshot:
+            tf_csv_path = output_dir / "track_frame_ids.csv"
+            with tf_csv_path.open("w", newline="", encoding="utf-8") as tf_csv:
+                writer = csv.writer(tf_csv)
+                writer.writerow(["track_id", "num_frames", "frame_indices", "frame_names"])
+                for tid in sorted(snapshot.keys()):
+                    frames = snapshot[tid]
+                    frame_names = snapshot_names.get(tid, [])
+                    writer.writerow([
+                        tid,
+                        len(frames),
+                        " ".join(str(x) for x in frames),
+                        " ".join(frame_names),
+                    ])
+            print(f"[Server] Track-Frame 汇总保存至: {tf_csv_path}")
+
     if _csv_file is not None and not _csv_file.closed:
         _csv_file.close()
         print("[Server] CSV 已关闭")
@@ -197,6 +229,24 @@ def detect():
     results = processor.process_frame(rgb, depth, pose, frame_idx=frame_idx)
 
     detections = [r.to_dict() for r in results]
+    objects_world = []
+    for det in detections:
+        wf = det.get("world_fused", None)
+        if wf is None or len(wf) != 3:
+            continue
+        objects_world.append({
+            "track_id": int(det.get("track_id", -1)),
+            "class_name": str(det.get("class_name", "")),
+            "world": [float(wf[0]), float(wf[1]), float(wf[2])],
+            "confidence": float(det.get("confidence", 0.0)),
+        })
+
+    with _latest_objects_lock:
+        global _latest_objects, _latest_frame_name, _latest_frame_idx
+        _latest_objects = objects_world
+        _latest_frame_name = frame_name
+        _latest_frame_idx = frame_idx
+
     inference_time = time.time() - t0
 
     # 打印每个检测到物体的类别名称
@@ -222,9 +272,10 @@ def detect():
                 cam = det["cam_xyz"]
                 wr = det["world_raw"]
                 wf = det["world_fused"]
+                tid = int(det["track_id"])
                 _csv_writer.writerow([
                     frame_idx, frame_name,
-                    det["track_id"], det["cls_id"], det["class_name"], det["confidence"],
+                    tid, det["cls_id"], det["class_name"], det["confidence"],
                     det["u"], det["v"],
                     bbox[0], bbox[1], bbox[2], bbox[3],
                     det["depth_m"],
@@ -232,6 +283,13 @@ def detect():
                     wr[0], wr[1], wr[2],
                     wf[0], wf[1], wf[2],
                 ])
+                with _track_frames_lock:
+                    if tid not in _track_frames:
+                        _track_frames[tid] = set()
+                    _track_frames[tid].add(frame_idx)
+                    if tid not in _track_frame_names:
+                        _track_frame_names[tid] = set()
+                    _track_frame_names[tid].add(frame_name)
             _flush_csv()
 
         # 写可视化图像
@@ -250,6 +308,7 @@ def detect():
         "frame_name": frame_name,
         "num_detections": len(detections),
         "detections": detections,
+        "objects_world": objects_world,
         "inference_time": inference_time,
     })
 
@@ -399,6 +458,22 @@ def list_classes():
         "frame_count": processor.frame_count,
         "total_tracks": len(summaries),
         "classes": class_counts,
+    })
+
+
+@app.route("/latest_objects", methods=["GET"])
+def latest_objects():
+    """返回最近一帧检测到的对象名称与世界坐标。"""
+    with _latest_objects_lock:
+        objs = list(_latest_objects)
+        fidx = _latest_frame_idx
+        fname = _latest_frame_name
+
+    return jsonify({
+        "frame_idx": fidx,
+        "frame_name": fname,
+        "num_objects": len(objs),
+        "objects_world": objs,
     })
 
 

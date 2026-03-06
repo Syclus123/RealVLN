@@ -58,6 +58,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import Image, LaserScan, PointCloud2
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
+from visualization_msgs.msg import Marker, MarkerArray
 
 try:
     import sensor_msgs_py.point_cloud2 as pc2
@@ -275,6 +276,7 @@ def detection_thread(
     frame_stride: int = 1,
     camera_frame: str | None = None,
     lidar_max_points: int = 2000,
+    marker_frame: str = "map",
 ):
     """
     frame_stride : 每隔多少帧处理一次。
@@ -328,8 +330,8 @@ def detection_thread(
                 T_base_cam=T_base_cam,
             )
         else:
-            pose = T_base_cam if T_base_cam is not None else np.eye(4, dtype=np.float64)
-            print("[Client] warn: no odom available, using camera offset pose")
+            pose = np.eye(4, dtype=np.float64)
+            print("[Client] warn: no odom available, handheld-camera test mode, using identity pose")
 
         # ── 激光雷达数据（可选）─────────────────────────────
         lidar_pts_cam: np.ndarray | None = None
@@ -414,6 +416,21 @@ def detection_thread(
                 msg = String()
                 msg.data = json.dumps(result)
                 manager.result_pub.publish(msg)
+
+                objects_world = result.get("objects_world", None)
+                if objects_world is None:
+                    objects_world = []
+                    for det in result.get("detections", []):
+                        wf = det.get("world_fused")
+                        if wf is None or len(wf) != 3:
+                            continue
+                        objects_world.append({
+                            "track_id": det.get("track_id", -1),
+                            "class_name": det.get("class_name", "unknown"),
+                            "world": wf,
+                            "confidence": det.get("confidence", 0.0),
+                        })
+                manager.publish_object_markers(objects_world, frame_id=marker_frame)
 
         except Exception as e:
             print(f"[Client] HTTP error: {e}")
@@ -567,6 +584,7 @@ class YoloDetectNode(Node):
         depth_topic: str,
         odom_topic: str,
         goal_topic: str = "/goal_pose",
+        marker_topic: str = "/yolo_detect/markers",
         lidar_topic: str | None = None,
         lidar_type: str = "laserscan",
     ):
@@ -623,6 +641,7 @@ class YoloDetectNode(Node):
 
         self.result_pub = self.create_publisher(String, "/yolo_detect/results", 10)
         self.goal_pub = self.create_publisher(PoseStamped, goal_topic, 10)
+        self.marker_pub = self.create_publisher(MarkerArray, marker_topic, 10)
 
         # TF2：用于获取 map→base_link 变换（比 odom 更准确）
         self.tf_buffer = Buffer()
@@ -640,7 +659,9 @@ class YoloDetectNode(Node):
         self.odom_queue = deque(maxlen=50)
         self.odom_timestamp = 0.0
 
-        self.get_logger().info(f"YoloDetectNode 已启动，goal_topic={goal_topic}")
+        self.get_logger().info(
+            f"YoloDetectNode 已启动，goal_topic={goal_topic}, marker_topic={marker_topic}"
+        )
 
     # ------------------------------------------------------------------
     # 激光雷达回调
@@ -777,6 +798,79 @@ class YoloDetectNode(Node):
         goal.pose.orientation.w = math.cos(half)
         self.goal_pub.publish(goal)
 
+    def publish_object_markers(
+        self,
+        objects_world: list[dict],
+        frame_id: str = "map",
+    ) -> None:
+        """发布目标可视化 MarkerArray：球体表示位置，文字显示类别与坐标。"""
+        now = self.get_clock().now().to_msg()
+        marker_array = MarkerArray()
+
+        clear_marker = Marker()
+        clear_marker.header.frame_id = frame_id
+        clear_marker.header.stamp = now
+        clear_marker.ns = "yolo_objects"
+        clear_marker.id = 0
+        clear_marker.action = Marker.DELETEALL
+        marker_array.markers.append(clear_marker)
+
+        for idx, obj in enumerate(objects_world):
+            world = obj.get("world", [0.0, 0.0, 0.0])
+            if world is None or len(world) != 3:
+                continue
+
+            track_id = int(obj.get("track_id", idx + 1))
+            class_name = str(obj.get("class_name", "unknown"))
+            conf = float(obj.get("confidence", 0.0))
+            x, y, z = float(world[0]), float(world[1]), float(world[2])
+
+            pos_marker = Marker()
+            pos_marker.header.frame_id = frame_id
+            pos_marker.header.stamp = now
+            pos_marker.ns = "yolo_object_pos"
+            pos_marker.id = track_id
+            pos_marker.type = Marker.SPHERE
+            pos_marker.action = Marker.ADD
+            pos_marker.pose.position.x = x
+            pos_marker.pose.position.y = y
+            pos_marker.pose.position.z = z
+            pos_marker.pose.orientation.w = 1.0
+            pos_marker.scale.x = 0.20
+            pos_marker.scale.y = 0.20
+            pos_marker.scale.z = 0.20
+            pos_marker.color.r = 0.1
+            pos_marker.color.g = 0.9
+            pos_marker.color.b = 0.1
+            pos_marker.color.a = 0.9
+            pos_marker.lifetime = Duration(seconds=1.0).to_msg()
+            marker_array.markers.append(pos_marker)
+
+            text_marker = Marker()
+            text_marker.header.frame_id = frame_id
+            text_marker.header.stamp = now
+            text_marker.ns = "yolo_object_text"
+            text_marker.id = track_id + 100000
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            text_marker.pose.position.x = x
+            text_marker.pose.position.y = y
+            text_marker.pose.position.z = z + 0.28
+            text_marker.pose.orientation.w = 1.0
+            text_marker.scale.z = 0.16
+            text_marker.color.r = 1.0
+            text_marker.color.g = 1.0
+            text_marker.color.b = 1.0
+            text_marker.color.a = 0.95
+            text_marker.text = (
+                f"{class_name}#{track_id} c={conf:.2f}\n"
+                f"({x:.2f}, {y:.2f}, {z:.2f})"
+            )
+            text_marker.lifetime = Duration(seconds=1.0).to_msg()
+            marker_array.markers.append(text_marker)
+
+        self.marker_pub.publish(marker_array)
+
     def rgb_depth_callback(self, rgb_msg, depth_msg):
         raw_rgb = self.cv_bridge.imgmsg_to_cv2(rgb_msg, "rgb8")
         pil_rgb = PIL_Image.fromarray(raw_rgb)
@@ -883,6 +977,12 @@ if __name__ == "__main__":
         help="发布导航目标的 ROS2 topic（默认 /goal_pose，Nav2 兼容）",
     )
     parser.add_argument(
+        "--marker-topic",
+        type=str,
+        default="/yolo_detect/markers",
+        help="发布检测结果可视化 MarkerArray 的话题（RViz2 订阅）",
+    )
+    parser.add_argument(
         "--map-frame",
         type=str,
         default="map",
@@ -960,6 +1060,7 @@ if __name__ == "__main__":
         f"  standoff={args.goal_standoff}m  z_offset={args.z_offset}m"
         f"  TF: {args.map_frame}→{args.base_link_frame}"
     )
+    print(f"[Client] RViz 标记发布: marker_topic={args.marker_topic}  frame={args.map_frame}")
     if args.lidar_topic:
         print(
             f"[Client] 激光雷达: topic={args.lidar_topic}"
@@ -984,6 +1085,7 @@ if __name__ == "__main__":
             frame_stride,
             args.camera_frame if args.lidar_topic else None,
             args.lidar_max_points,
+            args.map_frame,
         ),
         daemon=True,
     )
@@ -1006,6 +1108,7 @@ if __name__ == "__main__":
             depth_topic=args.depth_topic,
             odom_topic=args.odom_topic,
             goal_topic=args.goal_topic,
+            marker_topic=args.marker_topic,
             lidar_topic=args.lidar_topic,
             lidar_type=args.lidar_type,
         )
