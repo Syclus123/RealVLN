@@ -548,12 +548,12 @@ def interactive_thread(
             print("[Interactive] 机器人与目标几乎重合，跳过")
             continue
 
-        yaw = math.atan2(dy, dx)
-        move_dist = max(0.0, dist - goal_standoff)
-        ux, uy = dx / dist, dy / dist
-        goal_x = robot_x + ux * move_dist
-        goal_y = robot_y + uy * move_dist
+        goal_x = obj_x
+        goal_y = obj_y
         goal_z = obj_z + z_offset
+
+        # 朝向使用“目标点 -> 物体点”，而不是“机器人出发点 -> 目标点”
+        yaw = math.atan2(dy, dx)
 
         # ── 发布 PoseStamped ─────────────────────────────────────
         if manager is not None:
@@ -562,7 +562,7 @@ def interactive_thread(
                 f"[Interactive] ✓ 已发布目标 '{user_input}' track={chosen['track_id']}\n"
                 f"              goal=({goal_x:.3f}, {goal_y:.3f}, {goal_z:.3f})"
                 f"  yaw={math.degrees(yaw):.1f}°"
-                f"  standoff={goal_standoff:.2f}m  dist={dist:.2f}m"
+                f"  mode=object_pose  dist={dist:.2f}m"
             )
         else:
             print("[Interactive] ROS 节点未就绪，无法发布目标")
@@ -843,7 +843,7 @@ class YoloDetectNode(Node):
             pos_marker.color.g = 0.9
             pos_marker.color.b = 0.1
             pos_marker.color.a = 0.9
-            pos_marker.lifetime = Duration(seconds=1.0).to_msg()
+            pos_marker.lifetime = Duration(seconds=3.0).to_msg()
             marker_array.markers.append(pos_marker)
 
             text_marker = Marker()
@@ -866,7 +866,7 @@ class YoloDetectNode(Node):
                 f"{class_name}#{track_id} c={conf:.2f}\n"
                 f"({x:.2f}, {y:.2f}, {z:.2f})"
             )
-            text_marker.lifetime = Duration(seconds=1.0).to_msg()
+            text_marker.lifetime = Duration(seconds=3.0).to_msg()
             marker_array.markers.append(text_marker)
 
         self.marker_pub.publish(marker_array)

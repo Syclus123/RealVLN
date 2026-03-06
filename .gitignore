@@ -1,1 +1,4 @@
+\__pycache__/
 yolov8x-worldv2.pt
+yolo26x.pt
+output_realtime/
