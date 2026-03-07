@@ -839,6 +839,10 @@ class StreamProcessor:
         self._last_rgb_vis: np.ndarray | None = None
         self._last_depth_vis: np.ndarray | None = None
 
+        # root_id 变更追踪与 caption 存储（流式：新增 root 时由外部选一张图生成 caption）
+        self._prev_root_ids: set[int] = set()
+        self._root_id_captions: dict[int, str] = {}
+
     def reset(self) -> None:
         """清除所有跟踪状态，重新开始。"""
         self._tracks.clear()
@@ -851,6 +855,46 @@ class StreamProcessor:
         self._camera_positions.clear()
         self._last_rgb_vis = None
         self._last_depth_vis = None
+        self._prev_root_ids.clear()
+        self._root_id_captions.clear()
+
+    def get_root_id_changes(self, current_root_ids: set[int]) -> tuple[set[int], set[int]]:
+        """
+        与上一帧比较，返回本帧新增与消失的 root_id。
+        调用后会将内部「上一帧」更新为本帧的 current_root_ids。
+
+        Parameters
+        ----------
+        current_root_ids : set[int]
+            本帧 process_frame 返回结果中所有 track_id（即 root_id）的集合。
+
+        Returns
+        -------
+        added : set[int]
+            本帧新增的 root_id。
+        removed : set[int]
+            本帧消失的 root_id。
+        """
+        added = current_root_ids - self._prev_root_ids
+        removed = self._prev_root_ids - current_root_ids
+        self._prev_root_ids = set(current_root_ids)
+        return added, removed
+
+    def set_caption(self, root_id: int, caption: str) -> None:
+        """设置某个 root_id 的 caption。"""
+        self._root_id_captions[root_id] = caption
+
+    def get_caption(self, root_id: int) -> str | None:
+        """获取某个 root_id 的 caption，不存在则返回 None。"""
+        return self._root_id_captions.get(root_id)
+
+    def remove_caption(self, root_id: int) -> None:
+        """删除某个 root_id 的 caption。"""
+        self._root_id_captions.pop(root_id, None)
+
+    def get_all_captions(self) -> dict[int, str]:
+        """返回所有已记录的 root_id -> caption。"""
+        return dict(self._root_id_captions)
 
     def set_vocabulary(self, vocab: list[str]) -> None:
         """动态设置 YOLO-World 开放词表。"""

@@ -39,10 +39,12 @@ YOLO 目标检测 HTTP 服务端。
 
 import argparse
 import atexit
+import base64
 import csv
 import io
 import json
 import math
+import os
 import signal
 import sys
 import time
@@ -77,8 +79,12 @@ start_time: float = time.time()
 # ── 保存模式配置（由 main 写入） ─────────────────────────────────
 output_dir: Path | None = None
 save_vis: bool = False
-save_world_plot_flag: bool = False
+save_world_plot_flag: bool = False 
 world_plot_min_points: int = 3
+
+# ── Caption：新增 root_id 时选一张图生成描述（可选）
+_caption_enabled: bool = False
+_caption_client = None  # OpenAI 兼容客户端（如豆包），仅 --enable-caption 时初始化
 
 # 保存模式文件句柄 / 路径
 _csv_file = None
@@ -175,6 +181,54 @@ def _close_save_mode() -> None:
             print(f"[Server] 轨迹图生成失败: {e}")
 
 
+# ── Caption 生成（新增 root_id 时在完整帧上只标注该目标的 bbox）───
+def _draw_single_bbox(rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, float, float, float], class_name: str) -> np.ndarray:
+    """在原始 RGB 上只画一个目标的黄色 bbox + 类名标签，返回副本。"""
+    canvas = rgb_bgr.copy()
+    x1, y1, x2, y2 = int(round(bbox_xyxy[0])), int(round(bbox_xyxy[1])), int(round(bbox_xyxy[2])), int(round(bbox_xyxy[3]))
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    cv2.putText(canvas, class_name, (max(5, x1), max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    return canvas
+
+
+def _generate_caption_for_root(rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, float, float, float], class_name: str) -> str | None:
+    """
+    在完整帧上只标注该 root 的 bbox，调用多模态 API 生成一句与视角无关的物体描述。
+    保留完整场景以提供环境上下文，单一标注确保模型知道描述哪个目标。
+    """
+    global _caption_client
+    if _caption_client is None:
+        return None
+    annotated = _draw_single_bbox(rgb_bgr, bbox_xyxy, class_name)
+    _, buf = cv2.imencode(".jpg", annotated)
+    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    prompt = (
+        "黄色边界框标出的是目标物体。"
+        "请用100个字左右描述该物体：类型、主要颜色、形状，以及它与周围物体或环境特征的空间关系（如放在桌上、靠近墙壁、旁边有货架等）。"
+        "禁止使用与视角相关的表述（如图片左侧、前景中），"
+        "只使用物理空间关系词（如：上方、旁边、靠近）。"
+    )
+    try:
+        resp = _caption_client.chat.completions.create(
+            model=os.environ.get("ARK_CAPTION_MODEL", "doubao-seed-2-0-mini-260215"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text if text else None
+    except Exception as e:
+        print(f"[Server] Caption API 调用失败: {e}")
+        return None
+
+
 # ── /detect 路由 ─────────────────────────────────────────────────
 @app.route("/detect", methods=["POST"])
 def detect():
@@ -228,7 +282,31 @@ def detect():
 
     results = processor.process_frame(rgb, depth, pose, frame_idx=frame_idx)
 
-    detections = [r.to_dict() for r in results]
+    # 流式 caption：记录 root_id 新增/删除，对新增的用本帧该 root 的一张图生成 caption
+    current_root_ids = {r.track_id for r in results}
+    added_root_ids, removed_root_ids = processor.get_root_id_changes(current_root_ids)
+    if added_root_ids and _caption_enabled:
+        for root_id in added_root_ids:
+            match = next((r for r in results if r.track_id == root_id), None)
+            if match is None:
+                continue
+            caption = _generate_caption_for_root(rgb, match.bbox_xyxy, match.class_name)
+            if caption:
+                processor.set_caption(root_id, caption)
+                short = caption[:100] + "..." if len(caption) > 100 else caption
+                print(f"[Server] root_id={root_id} ({match.class_name}) caption: {short}")
+    for root_id in removed_root_ids:
+        if processor.get_caption(root_id) is not None:
+            processor.remove_caption(root_id)
+            print(f"[Server] root_id={root_id} 已消失，caption 已清除")
+
+    detections = []
+    for r in results:
+        d = r.to_dict()
+        cap = processor.get_caption(r.track_id)
+        if cap is not None:
+            d["caption"] = cap
+        detections.append(d)
     objects_world = []
     for det in detections:
         wf = det.get("world_fused", None)
@@ -327,11 +405,26 @@ def reset():
 def tracks():
     source = request.args.get("source", "fused")
     summaries = processor.get_all_track_summaries(source=source)
+    captions = processor.get_all_captions()
+    # 为每个 track 附带 caption（若有）
+    tracks_out = {}
+    for k, v in summaries.items():
+        out = dict(v)
+        if k in captions:
+            out["caption"] = captions[k]
+        tracks_out[str(k)] = out
     return jsonify({
         "frame_count": processor.frame_count,
         "num_tracks": len(summaries),
-        "tracks": {str(k): v for k, v in summaries.items()},
+        "tracks": tracks_out,
     })
+
+
+@app.route("/captions", methods=["GET"])
+def get_captions():
+    """返回所有 root_id -> caption 的映射。"""
+    captions = processor.get_all_captions()
+    return jsonify({"captions": {str(k): v for k, v in captions.items()}})
 
 
 @app.route("/save_plot", methods=["POST"])
@@ -383,64 +476,139 @@ def vis_depth():
     return send_file(buf, mimetype="image/jpeg")
 
 
+def _match_query_by_caption(user_query: str, captions: dict[int, str]) -> list[int]:
+    """
+    用多模态 API（文本模式）从已有 caption 中找出与用户 query 最匹配的 root_id 列表。
+    返回匹配的 root_id（按相关性排序），无匹配返回空列表。
+    """
+    if not _caption_client or not captions:
+        return []
+
+    candidates = "\n".join(f"- root_id={rid}: {cap}" for rid, cap in captions.items())
+    prompt = (
+        f"用户想要找到的目标：{user_query}\n\n"
+        f"以下是当前场景中已追踪到的物体及其描述：\n{candidates}\n\n"
+        "请从上面的列表中选出与用户描述最匹配的物体。"
+        "只输出匹配物体的 root_id，用逗号分隔，按匹配度从高到低排列。"
+        "如果没有任何匹配，输出 NONE。"
+        "只输出 root_id 数字，不要输出任何其他内容。"
+    )
+    try:
+        resp = _caption_client.chat.completions.create(
+            model=os.environ.get("ARK_CAPTION_MODEL", "doubao-seed-2-0-pro-260215"),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=64,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+        if answer.upper() == "NONE" or not answer:
+            return []
+        result = []
+        for token in answer.replace(" ", "").split(","):
+            try:
+                rid = int(token)
+                if rid in captions:
+                    result.append(rid)
+            except ValueError:
+                continue
+        return result
+    except Exception as e:
+        print(f"[Server] Caption 语义匹配失败: {e}")
+        return []
+
+
 @app.route("/query", methods=["POST"])
 def query():
     """
-    按类别名称查询已追踪的目标，返回按距离排序的匹配列表。
+    查询已追踪的目标，返回按距离排序的匹配列表。
+    优先按类别名精确匹配；无结果时回退到基于 caption 的语义匹配。
 
     请求 JSON：
-        class_name (str)           : 目标类别（如 "box"），大小写不敏感
+        class_name (str)           : 用户查询（类别名或自然语言描述）
         robot_x    (float, 可选)   : 机器人当前 x 坐标（世界系），用于排距离
         robot_y    (float, 可选)   : 机器人当前 y 坐标
 
     返回 JSON：
         {
             "class_name": str,
+            "match_mode": "exact" | "caption",
             "num_matches": int,
             "matches": [
                 {
                     "track_id": int,
                     "class_name": str,
+                    "caption": str | null,
                     "num_points": int,
                     "mean_conf": float,
-                    "position": [x, y, z],          ← world_fused 均值位置
+                    "position": [x, y, z],
                     "distance_to_robot": float
                 }, ...
             ]  ← 按 distance_to_robot 升序
         }
     """
     data = request.get_json(force=True, silent=True) or {}
-    class_name = str(data.get("class_name", "")).lower().strip()
+    user_query = str(data.get("class_name", "")).strip()
     robot_x = float(data.get("robot_x", 0.0))
     robot_y = float(data.get("robot_y", 0.0))
 
-    if not class_name:
+    if not user_query:
         return jsonify({"error": "class_name is required"}), 400
 
     summaries = processor.get_all_track_summaries(source="fused")
+    captions = processor.get_all_captions()
 
-    matches = []
-    for tid, info in summaries.items():
-        if info["class_name"].lower() != class_name:
-            continue
+    def _build_match(tid: int, info: dict) -> dict | None:
         pos = info.get("last_position")
         if pos is None:
-            continue
+            return None
         dx = pos[0] - robot_x
         dy = pos[1] - robot_y
         dist = math.sqrt(dx * dx + dy * dy)
-        matches.append({
+        return {
             "track_id": int(tid),
             "class_name": info["class_name"],
+            "caption": captions.get(tid),
             "num_points": info["num_points"],
             "mean_conf": round(info["mean_conf"], 4),
             "position": pos,
             "distance_to_robot": round(dist, 4),
+        }
+
+    # 1) 精确类别匹配
+    matches = []
+    query_lower = user_query.lower()
+    for tid, info in summaries.items():
+        if info["class_name"].lower() == query_lower:
+            m = _build_match(tid, info)
+            if m:
+                matches.append(m)
+
+    if matches:
+        matches.sort(key=lambda m: m["distance_to_robot"])
+        return jsonify({
+            "class_name": user_query,
+            "match_mode": "exact",
+            "num_matches": len(matches),
+            "matches": matches,
         })
 
-    matches.sort(key=lambda m: m["distance_to_robot"])
+    # 2) 基于 caption 的语义匹配（需 --enable-caption 且有 caption 数据）
+    if _caption_enabled and captions:
+        matched_ids = _match_query_by_caption(user_query, captions)
+        for rid in matched_ids:
+            info = summaries.get(rid)
+            if info is None:
+                continue
+            m = _build_match(rid, info)
+            if m:
+                matches.append(m)
+
+    if matches:
+        matches.sort(key=lambda m: m["distance_to_robot"])
+
     return jsonify({
-        "class_name": class_name,
+        "class_name": user_query,
+        "match_mode": "caption" if matches else "none",
         "num_matches": len(matches),
         "matches": matches,
     })
@@ -544,6 +712,10 @@ if __name__ == "__main__":
         "--world-plot-min-points", type=int, default=3,
         help="轨迹图最少点数阈值",
     )
+    parser.add_argument(
+        "--enable-caption", action="store_true",
+        help="对新增的 root_id 用本帧裁剪图调用多模态 API 生成 caption；需环境变量 ARK_API_KEY（可选 ARK_BASE_URL、ARK_CAPTION_MODEL）",
+    )
 
     args = parser.parse_args()
 
@@ -568,6 +740,21 @@ if __name__ == "__main__":
         track_max_miss=args.track_max_miss,
         merge_distance_thres=args.merge_distance_thres,
     )
+
+    # ── Caption（新增 root 时选一张图生成描述）────────────────────
+    _caption_enabled = args.enable_caption
+    if _caption_enabled:
+        ark_key = os.environ.get("ARK_API_KEY")
+        if ark_key:
+            from openai import OpenAI
+            _caption_client = OpenAI(
+                base_url=os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
+                api_key=ark_key,
+            )
+            print("[Server] Caption 已开启（豆包/方舟多模态 API）")
+        else:
+            _caption_enabled = False
+            print("[Server] --enable-caption 已忽略：未设置环境变量 ARK_API_KEY")
 
     # ── 初始化保存模式 ───────────────────────────────────────────
     save_vis = args.save_vis
