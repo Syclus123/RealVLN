@@ -63,7 +63,7 @@ from flask import Flask, jsonify, request, send_file
 from PIL import Image
 
 print("[Server] 正在加载 StreamProcessor（含 YOLO 模型定义）...")
-from stream_vln import StreamProcessor
+from stream_vln import StreamProcessor, parse_vocab_arg
 
 print("[Server] 依赖加载完成")
 
@@ -495,7 +495,10 @@ if __name__ == "__main__":
     # 模型
     parser.add_argument("--model", type=str, default="yolov8s-world.pt")
     parser.add_argument("--conf", type=float, default=0.4)
-    parser.add_argument("--vocab", type=str, default=None)
+    parser.add_argument(
+        "--vocab", type=str, default=None,
+        help="YOLO-World 词表：逗号分隔字符串、txt 文件路径、或 JSON 文件路径（如 yolo_vocab/obj365v1_class_texts.json）",
+    )
     parser.add_argument("--classes", type=str, default=None)
 
     # 相机
@@ -545,9 +548,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # ── 初始化 StreamProcessor ───────────────────────────────────
-    vocab_list = None
-    if args.vocab:
-        vocab_list = [v.strip() for v in args.vocab.split(",") if v.strip()]
+    vocab_list = parse_vocab_arg(args.vocab)
 
     processor = StreamProcessor(
         model=args.model,

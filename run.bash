@@ -92,8 +92,45 @@ python -u yolo_detect_server.py \
 python -u yolo_detect_server.py \
     --model yolov8x-worldv2.pt \
     --cam-json cam_params.json \
-    --vocab "chair,bag,box,sofa,plant,desk,bottle,potted plant,trash can,bin,bed,fridge,elevator,elevator door,door,umbrella,toilet,table,refrigerator" --conf 0.35 \
+    --vocab "chair,bag,box,sofa,plant,desk,bottle,potted plant,trash can,bin,bed,fridge,elevator,elevator door,door,umbrella,table,refrigerator," --conf 0.35 \
     --fusion moving_average --moving-avg-window 5 \
+    --merge-distance-thres 0.2 \
+    --output-dir ./output_realtime \
+    --save-vis \
+    --save-world-plot \
+    --port 5802
+
+python -u yolo_detect_server.py \
+    --model yolo26x.pt \
+    --cam-json cam_params.json \
+    --fusion moving_average --moving-avg-window 5 \
+    --merge-distance-thres 0.2 \
+    --output-dir ./output_realtime \
+    --save-vis \
+    --save-world-plot \
+    --port 5802
+
+open:
+python -u yolo_detect_server.py \
+    --model yolov8x-worldv2.pt \
+    --vocab yolo_vocab/obj365v1_class_texts.json \
+    --conf 0.35 \
+    --cam-json cam_params.json \
+    --fusion moving_average --moving-avg-window 5 \
+    --merge-distance-thres 0.2 \
+    --output-dir ./output_realtime \
+    --save-vis \
+    --save-world-plot \
+    --port 5802
+
+deepseek intent recognition:
+python -u yolo_detect_server.py \
+    --model yolov8x-worldv2.pt \
+    --vocab yolo_vocab/obj365v1_class_texts.json \
+    --conf 0.35 \
+    --cam-json cam_params.json \
+    --fusion moving_average --moving-avg-window 5 \
+    --deepseek-api-key sk-xxxxxxxxxxxxxxxx \
     --merge-distance-thres 0.2 \
     --output-dir ./output_realtime \
     --save-vis \

@@ -207,6 +207,20 @@ def parse_vocab_arg(vocab_arg: str | None) -> list[str] | None:
 
     path = Path(vocab_arg)
     if path.exists() and path.is_file():
+        if path.suffix.lower() == ".json":
+            # JSON 格式：支持 obj365 等 [["class1"], ["class2", "alias"], ...]，取每项第一个作为类名
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                tokens = []
+                for item in raw:
+                    if isinstance(item, list):
+                        if item:
+                            tokens.append(str(item[0]).strip())
+                    elif isinstance(item, str):
+                        tokens.append(item.strip())
+                return tokens if tokens else None
+            return None
+        # 文本格式：按行读取
         tokens = [
             line.strip()
             for line in path.read_text(encoding="utf-8").splitlines()

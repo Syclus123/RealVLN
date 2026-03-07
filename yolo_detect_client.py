@@ -11,6 +11,10 @@ YOLO 目标检测 HTTP 客户端（ROS2 版），含交互式语义导航目标�
       2. 用 TF (map→base_link) 获取机器人当前位置（失败则回退到 odom）
       3. 选取最近的 track，按 standoff 距离计算导航目标点
       4. 发布 PoseStamped 到 /goal_pose（Nav2 兼容）
+  - 自然语言意图解析模式（需 --deepseek-api-key）：
+      输入中文或自然语言描述（如"请寻找一把椅子"），
+      自动调用 DeepSeek API 从当前 YOLO 检测类别列表中匹配最合适的物体名，
+      再执行查询与导航目标发布。
 
 启动：
     python -u yolo_detect_client.py \
@@ -19,12 +23,14 @@ YOLO 目标检测 HTTP 客户端（ROS2 版），含交互式语义导航目标�
         --frame-stride 10 \
         --goal-standoff 0.6 \
         --map-frame map \
-        --base-link-frame base_link
+        --base-link-frame base_link \
+        --deepseek-api-key <YOUR_API_KEY>
 
 交互命令（运行后在终端输入）：
-    box          查询 "box" 类别，找到后直接发布导航目标
-    list         列出 server 中所有已追踪物体类别
-    q / quit     退出交互线程（检测仍继续）
+    chair                  直接查询 "chair" 类别，找到后发布导航目标
+    请帮我找一把椅子       自然语言模式：DeepSeek 解析后匹配类别，再发布导航目标
+    list                   列出 server 中所有已追踪物体类别
+    q / quit               退出交互线程（检测仍继续）
 """
 
 from __future__ import annotations
@@ -122,7 +128,7 @@ def call_detect(
     )
     elapsed = time.time() - t0
     lidar_info = f"  lidar_pts={lidar_points_cam.shape[0]}" if lidar_points_cam is not None else ""
-    print(f"[Client] HTTP {response.status_code}, cost {elapsed:.3f}s{lidar_info}")
+    # print(f"[Client] HTTP {response.status_code}, cost {elapsed:.3f}s{lidar_info}")
 
     return json.loads(response.text)
 
@@ -153,6 +159,92 @@ def call_list_classes(base_url: str, timeout: float = 5.0) -> dict:
     """查询 server 当前已追踪到的所有物体类别。"""
     resp = requests.get(f"{base_url}/list_classes", timeout=timeout)
     return resp.json()
+
+
+# -------------------------------------------
+# DeepSeek 意图解析
+# -------------------------------------------
+def parse_intent_with_deepseek(
+    user_query: str,
+    candidate_classes: list[str],
+    api_key: str,
+    base_url: str = "https://api.deepseek.com",
+    model: str = "deepseek-chat",
+    timeout: float = 15.0,
+) -> str | None:
+    """
+    调用 DeepSeek API，将用户自然语言描述映射到 YOLO 检测类别列表中最匹配的一个。
+
+    Parameters
+    ----------
+    user_query        : 用户输入，如 "请帮我找一把椅子"
+    candidate_classes : YOLO 当前已追踪到的物体类别列表，如 ["chair", "potted plant", "box"]
+    api_key           : DeepSeek API Key
+    base_url          : DeepSeek API 根地址（默认 https://api.deepseek.com）
+    model             : 使用的模型名（默认 deepseek-chat）
+    timeout           : HTTP 请求超时（秒）
+
+    Returns
+    -------
+    str | None : 最匹配的类别名（来自 candidate_classes），解析失败时返回 None
+    """
+    if not candidate_classes:
+        return None
+
+    candidates_str = "\n".join(f"- {c}" for c in candidate_classes)
+    system_prompt = (
+        "你是一个机器人语义导航助手。"
+        "用户会用自然语言描述想要寻找的物体，"
+        "你需要从给定的候选类别列表中选出最匹配的一个类别名称，"
+        "直接输出该类别名称，不要输出任何其他内容。"
+        "如果没有任何匹配的类别，输出 NONE。"
+    )
+    user_prompt = (
+        f"用户描述：{user_query}\n\n"
+        f"候选类别列表：\n{candidates_str}\n\n"
+        "请从上面的候选类别中选出最匹配的一个，直接输出类别名称："
+    )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 64,
+    }
+
+    try:
+        resp = requests.post(
+            f"{base_url.rstrip('/')}/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        answer = result["choices"][0]["message"]["content"].strip()
+        if answer.upper() == "NONE" or not answer:
+            return None
+        # 校验返回值是否在候选列表中（大小写不敏感）
+        answer_lower = answer.lower()
+        for cls in candidate_classes:
+            if cls.lower() == answer_lower:
+                return cls
+        # 若不完全匹配，尝试子串匹配（防止模型输出带引号或多余空格）
+        for cls in candidate_classes:
+            if cls.lower() in answer_lower or answer_lower in cls.lower():
+                return cls
+        # 返回原始答案，交由调用方处理
+        return answer
+    except Exception as e:
+        print(f"[DeepSeek] API 调用失败: {e}")
+        return None
 
 
 # -------------------------------------------
@@ -442,31 +534,59 @@ def detection_thread(
 # -------------------------------------------
 # Interactive semantic navigation thread
 # -------------------------------------------
+def _is_natural_language(text: str) -> bool:
+    """
+    判断输入是否为自然语言描述（而非直接的类别名称）。
+    若包含中文字符、或包含空格且长度 > 6，则视为自然语言。
+    """
+    if any('\u4e00' <= ch <= '\u9fff' for ch in text):
+        return True
+    if ' ' in text and len(text) > 6:
+        return True
+    return False
+
+
 def interactive_thread(
     base_url: str,
     goal_standoff: float,
     z_offset: float,
     map_frame: str,
     base_link_frame: str,
+    deepseek_api_key: str | None = None,
+    deepseek_base_url: str = "https://api.deepseek.com",
+    deepseek_model: str = "deepseek-chat",
 ) -> None:
     """
     从终端读取用户输入，查询 server 中对应类别的目标，
     选取距机器人最近的 track，计算 standoff 目标点后发布 PoseStamped。
 
     命令：
-      <类别名>   查询并发布导航目标（如 box、chair）
-      list       列出当前 server 中已追踪到的所有类别
-      q / quit   退出本线程（检测继续运行）
+      <类别名>          直接查询并发布导航目标（如 box、chair）
+      <自然语言描述>    调用 DeepSeek API 解析意图，匹配最近类别后发布目标
+                        （如 "请寻找一把椅子"、"帮我找盆栽"）
+      list              列出当前 server 中已追踪到的所有类别
+      q / quit          退出本线程（检测继续运行）
+
+    自然语言模式触发条件：
+      - 输入包含中文字符，或
+      - 输入包含空格且长度 > 6
+    需要通过 --deepseek-api-key 提供 DeepSeek API Key。
     """
-    print("\n" + "=" * 55)
+    has_deepseek = bool(deepseek_api_key)
+
+    print("\n" + "=" * 60)
     print("  语义导航交互模式已启动")
     print("  输入目标类别后按 Enter 发布导航目标")
+    if has_deepseek:
+        print("  支持自然语言描述（如：请寻找一把椅子）")
+    else:
+        print("  [提示] 未配置 --deepseek-api-key，自然语言模式不可用")
     print("  输入 'list' 查看已追踪物体，'q' 退出")
-    print("=" * 55)
+    print("=" * 60)
 
     while True:
         try:
-            user_input = input("\n目标类别 > ").strip().lower()
+            user_input = input("\n目标 > ").strip()
         except (EOFError, KeyboardInterrupt):
             print("[Interactive] 退出交互线程")
             break
@@ -474,12 +594,12 @@ def interactive_thread(
         if not user_input:
             continue
 
-        if user_input in ("q", "quit", "exit"):
+        if user_input.lower() in ("q", "quit", "exit"):
             print("[Interactive] 退出交互线程")
             break
 
         # ── list：列出已追踪类别 ────────────────────────────────
-        if user_input == "list":
+        if user_input.lower() == "list":
             try:
                 data = call_list_classes(base_url)
                 classes = data.get("classes", {})
@@ -494,6 +614,49 @@ def interactive_thread(
             except Exception as e:
                 print(f"[Interactive] list 查询失败: {e}")
             continue
+
+        # ── 自然语言意图解析模式 ────────────────────────────────
+        query_class = user_input.lower()
+        if _is_natural_language(user_input):
+            if not has_deepseek:
+                print(
+                    "[Interactive] 检测到自然语言输入，但未配置 --deepseek-api-key，"
+                    "请直接输入英文类别名（如 chair）或添加 --deepseek-api-key 参数"
+                )
+                continue
+
+            # 获取当前已追踪的所有类别
+            try:
+                list_data = call_list_classes(base_url)
+                candidate_classes = list(list_data.get("classes", {}).keys())
+            except Exception as e:
+                print(f"[Interactive] 获取类别列表失败: {e}")
+                continue
+
+            if not candidate_classes:
+                print("[Interactive] 当前 server 中暂未追踪到任何物体，无法进行意图匹配")
+                continue
+
+            print(
+                f"[Interactive] 正在用 DeepSeek 解析意图：'{user_input}'\n"
+                f"              候选类别：{candidate_classes}"
+            )
+            matched = parse_intent_with_deepseek(
+                user_query=user_input,
+                candidate_classes=candidate_classes,
+                api_key=deepseek_api_key,
+                base_url=deepseek_base_url,
+                model=deepseek_model,
+            )
+            if matched is None:
+                print(
+                    f"[Interactive] DeepSeek 未能从候选类别中匹配到合适的物体，"
+                    f"请尝试直接输入类别名或修改描述"
+                )
+                continue
+
+            print(f"[Interactive] DeepSeek 解析结果：'{user_input}' → '{matched}'")
+            query_class = matched.lower()
 
         # ── 获取机器人当前位置：TF 优先，回退 odom ───────────────
         robot_x, robot_y = 0.0, 0.0
@@ -515,17 +678,17 @@ def interactive_thread(
 
         # ── 查询 server ──────────────────────────────────────────
         try:
-            data = call_query(base_url, user_input, robot_x, robot_y)
+            data = call_query(base_url, query_class, robot_x, robot_y)
         except Exception as e:
             print(f"[Interactive] 查询失败: {e}")
             continue
 
         matches = data.get("matches", [])
         if not matches:
-            print(f"[Interactive] 未找到类别 '{user_input}'，输入 'list' 查看已追踪物体")
+            print(f"[Interactive] 未找到类别 '{query_class}'，输入 'list' 查看已追踪物体")
             continue
 
-        print(f"[Interactive] 查询 '{user_input}'，找到 {len(matches)} 个 track：")
+        print(f"[Interactive] 查询 '{query_class}'，找到 {len(matches)} 个 track：")
         for i, m in enumerate(matches):
             pos = m["position"]
             marker = "  ← 最近，已选" if i == 0 else ""
@@ -558,8 +721,13 @@ def interactive_thread(
         # ── 发布 PoseStamped ─────────────────────────────────────
         if manager is not None:
             manager.publish_goal(goal_x, goal_y, goal_z, yaw, frame_id=map_frame)
+            display_label = (
+                f"{user_input} → {query_class}"
+                if query_class != user_input.lower()
+                else query_class
+            )
             print(
-                f"[Interactive] ✓ 已发布目标 '{user_input}' track={chosen['track_id']}\n"
+                f"[Interactive] ✓ 已发布目标 '{display_label}' track={chosen['track_id']}\n"
                 f"              goal=({goal_x:.3f}, {goal_y:.3f}, {goal_z:.3f})"
                 f"  yaw={math.degrees(yaw):.1f}°"
                 f"  mode=object_pose  dist={dist:.2f}m"
@@ -1035,6 +1203,25 @@ if __name__ == "__main__":
         default=32000,
         help="每帧发送给 server 的最大激光雷达点数（默认 32000）",
     )
+    # ── DeepSeek 意图解析参数 ─────────────────────────────────
+    parser.add_argument(
+        "--deepseek-api-key",
+        type=str,
+        default=None,
+        help="DeepSeek API Key，用于自然语言意图解析（不填则禁用自然语言模式）",
+    )
+    parser.add_argument(
+        "--deepseek-base-url",
+        type=str,
+        default="https://api.deepseek.com",
+        help="DeepSeek API 根地址（默认 https://api.deepseek.com）",
+    )
+    parser.add_argument(
+        "--deepseek-model",
+        type=str,
+        default="deepseek-chat",
+        help="DeepSeek 模型名（默认 deepseek-chat）",
+    )
     args = parser.parse_args()
 
     # 构建 T_base_cam：优先使用命令行偏移，其次从 cam_params.json 读取
@@ -1097,6 +1284,9 @@ if __name__ == "__main__":
             args.z_offset,
             args.map_frame,
             args.base_link_frame,
+            args.deepseek_api_key,
+            args.deepseek_base_url,
+            args.deepseek_model,
         ),
         daemon=True,
     )
