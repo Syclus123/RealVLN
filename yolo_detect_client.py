@@ -64,7 +64,6 @@ from rclpy.time import Time
 from action_msgs.msg import GoalStatusArray, GoalStatus
 from sensor_msgs.msg import Image, LaserScan, PointCloud2
 from std_msgs.msg import String
-from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
 try:
@@ -332,34 +331,6 @@ manager = None  # will be set to YoloDetectNode instance
 
 
 # -------------------------------------------
-# TF 工具：TransformStamped → 4×4 齐次变换矩阵
-# -------------------------------------------
-def transform_stamped_to_matrix(tf_stamped) -> np.ndarray:
-    """
-    将 geometry_msgs/TransformStamped 转换为 4×4 齐次变换矩阵。
-    旋转用四元数 (qx, qy, qz, qw) 表示。
-    """
-    t = tf_stamped.transform.translation
-    q = tf_stamped.transform.rotation
-    qx, qy, qz, qw = q.x, q.y, q.z, q.w
-
-    T = np.eye(4, dtype=np.float64)
-    T[0, 0] = 1 - 2 * (qy * qy + qz * qz)
-    T[0, 1] = 2 * (qx * qy - qz * qw)
-    T[0, 2] = 2 * (qx * qz + qy * qw)
-    T[1, 0] = 2 * (qx * qy + qz * qw)
-    T[1, 1] = 1 - 2 * (qx * qx + qz * qz)
-    T[1, 2] = 2 * (qy * qz - qx * qw)
-    T[2, 0] = 2 * (qx * qz - qy * qw)
-    T[2, 1] = 2 * (qy * qz + qx * qw)
-    T[2, 2] = 1 - 2 * (qx * qx + qy * qy)
-    T[0, 3] = t.x
-    T[1, 3] = t.y
-    T[2, 3] = t.z
-    return T
-
-
-# -------------------------------------------
 # Detection thread
 # -------------------------------------------
 def detection_thread(
@@ -375,7 +346,7 @@ def detection_thread(
     frame_stride : 每隔多少帧处理一次。
       1  = 每帧都处理（默认）
       10 = 每 10 帧处理 1 帧（跳过中间 9 帧）
-    camera_frame : 相机光学坐标系 frame id，用于 TF 查询 T_cam_lidar。
+    camera_frame : 保留参数（兼容旧命令行），当前不用于 TF 变换。
                    为 None 时不发送激光雷达数据。
     lidar_max_points : 发送给 server 的最大点数，超出则随机下采样。
     """
@@ -435,38 +406,23 @@ def detection_thread(
             lidar_rw_lock.release_read()
 
             if lidar_pts_raw is not None and lidar_frame_id:
-                T_cam_lidar = manager.get_T_cam_lidar(
-                    camera_frame=camera_frame,
-                    lidar_frame=lidar_frame_id,
+                _t_prepare0 = time.time()
+                pts_send = lidar_pts_raw
+
+                # 随机下采样限制点数
+                if pts_send.shape[0] > lidar_max_points:
+                    idx = np.random.choice(pts_send.shape[0], lidar_max_points, replace=False)
+                    pts_send = pts_send[idx]
+                lidar_pts_cam = pts_send.astype(np.float32)
+
+                _t_prepare1 = time.time()
+                _payload_kb = lidar_pts_cam.nbytes / 1024.0
+                print(
+                    f"[DEBUG][LiDAR] raw={lidar_pts_raw.shape[0]}pts"
+                    f"  no_tf_transform"
+                    f"  send={lidar_pts_cam.shape[0]}pts({_payload_kb:.1f}KB)"
+                    f"  prepare={(_t_prepare1 - _t_prepare0)*1000:.2f}ms"
                 )
-                if T_cam_lidar is not None:
-                    # ── [DEBUG] 坐标变换计时 ──────────────────────────
-                    _t_transform0 = time.time()
-                    n_raw = lidar_pts_raw.shape[0]
-
-                    # 齐次坐标变换：激光雷达系 → 相机光学系
-                    ones = np.ones((n_raw, 1), dtype=np.float32)
-                    pts_hom = np.hstack([lidar_pts_raw, ones])
-                    pts_cam = (T_cam_lidar @ pts_hom.T).T[:, :3]
-
-                    _t_transform1 = time.time()
-
-                    # 随机下采样限制点数
-                    if pts_cam.shape[0] > lidar_max_points:
-                        idx = np.random.choice(pts_cam.shape[0], lidar_max_points, replace=False)
-                        pts_cam = pts_cam[idx]
-                    lidar_pts_cam = pts_cam.astype(np.float32)
-
-                    _t_transform2 = time.time()
-                    _payload_kb = lidar_pts_cam.nbytes / 1024.0
-                    print(
-                        f"[DEBUG][LiDAR] raw={n_raw}pts"
-                        f"  transform={(_t_transform1 - _t_transform0)*1000:.2f}ms"
-                        f"  downsample={(_t_transform2 - _t_transform1)*1000:.2f}ms"
-                        f"  send={lidar_pts_cam.shape[0]}pts({_payload_kb:.1f}KB)"
-                        f"  total_prepare={(_t_transform2 - _t_transform0)*1000:.2f}ms"
-                    )
-                    # ─────────────────────────────────────────────────
 
         try:
             _t_http0 = time.time()
@@ -617,21 +573,16 @@ def interactive_thread(
             continue
         query_class = user_input
 
-        # ── 获取机器人当前位置：TF 优先，回退 odom ───────────────
+        # ── 获取机器人当前位置：仅使用 odom（不依赖 TF） ─────────
         robot_x, robot_y = 0.0, 0.0
         pos_source = "default(0,0)"
         if manager is not None:
-            tf_pos = manager.get_robot_xy(map_frame, base_link_frame)
-            if tf_pos is not None:
-                robot_x, robot_y = tf_pos
-                pos_source = f"TF({map_frame}→{base_link_frame})"
-            else:
-                odom_rw_lock.acquire_read()
-                odom_snapshot = copy.deepcopy(manager.odom)
-                odom_rw_lock.release_read()
-                if odom_snapshot is not None:
-                    robot_x, robot_y = odom_snapshot[0], odom_snapshot[1]
-                    pos_source = "odom(fallback)"
+            odom_rw_lock.acquire_read()
+            odom_snapshot = copy.deepcopy(manager.odom)
+            odom_rw_lock.release_read()
+            if odom_snapshot is not None:
+                robot_x, robot_y = odom_snapshot[0], odom_snapshot[1]
+                pos_source = "odom"
 
         print(f"[Interactive] 机器人位置: ({robot_x:.3f}, {robot_y:.3f})  来源={pos_source}")
 
@@ -778,10 +729,6 @@ class YoloDetectNode(Node):
         )
         self._succeeded_goal_ids: set[tuple[int, ...]] = set()
 
-        # TF2：用于获取 map→base_link 变换（比 odom 更准确）
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
         self.cv_bridge = CvBridge()
         self.rgb_bytes = None
         self.depth_bytes = None
@@ -851,66 +798,9 @@ class YoloDetectNode(Node):
         self.lidar_time = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
         lidar_rw_lock.release_write()
 
-    def get_T_cam_lidar(
-        self,
-        camera_frame: str,
-        lidar_frame: str,
-        tf_timeout_sec: float = 0.5,
-    ) -> np.ndarray | None:
-        """
-        查询 camera_frame ← lidar_frame 的 4×4 变换矩阵，并缓存。
-        由于相机与激光雷达的安装关系为静态变换，首次查询成功后直接缓存复用。
-        查询失败返回 None。
-        """
-        with self._T_cam_lidar_lock:
-            if self._T_cam_lidar_cache is not None:
-                return self._T_cam_lidar_cache
-        try:
-            tf_stamped = self.tf_buffer.lookup_transform(
-                camera_frame,
-                lidar_frame,
-                Time(),
-                timeout=Duration(seconds=tf_timeout_sec),
-            )
-            T = transform_stamped_to_matrix(tf_stamped)
-            with self._T_cam_lidar_lock:
-                self._T_cam_lidar_cache = T
-            self.get_logger().info(
-                f"[LiDAR] T_cam_lidar 缓存成功 ({lidar_frame} → {camera_frame})\n{T}"
-            )
-            return T
-        except TransformException as exc:
-            self.get_logger().warning(
-                f"[LiDAR] TF 查询失败 ({lidar_frame} → {camera_frame}): {exc}"
-            )
-            return None
-
     # ------------------------------------------------------------------
     # 导航 / 里程计 / 姿态
     # ------------------------------------------------------------------
-    def get_robot_xy(
-        self,
-        map_frame: str = "map",
-        base_link_frame: str = "base_link",
-        tf_timeout_sec: float = 0.2,
-    ) -> tuple[float, float] | None:
-        """
-        通过 TF 查询机器人当前在 map 坐标系下的 (x, y)。
-        查询失败返回 None（由调用方决定是否回退到 odom）。
-        """
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                map_frame,
-                base_link_frame,
-                Time(),
-                timeout=Duration(seconds=tf_timeout_sec),
-            )
-            x = float(transform.transform.translation.x)
-            y = float(transform.transform.translation.y)
-            return x, y
-        except TransformException as exc:
-            self.get_logger().warning(f"TF查询失败 ({map_frame}→{base_link_frame}): {exc}")
-            return None
 
     def publish_goal(
         self,
