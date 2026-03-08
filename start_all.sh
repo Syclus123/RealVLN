@@ -29,9 +29,10 @@ tmux select-layout -t "$SESSION:0" tiled
 
 # pane 对应关系：
 # 0.0 tunnel, 0.1 robot, 0.2 ros2, 0.3 yolo
+# 转发 server 检测端口(5802)ssh -N -L 5802:127.0.0.1:5802 -L 8080:127.0.0.1:8080；Web UI(8080) 在 Client 本地运行，无需转发
 run_in_target "$SESSION:0.0" "sshpass -p t0pxxqky ssh -N -L 5802:127.0.0.1:5802 -p 30438 root@183.147.142.40"
 run_in_target "$SESSION:0.1" "cd ~/InternNav-deploy/onboard/ && ./start_robot.sh"
-run_in_target "$SESSION:0.2" "ros2 launch go2_core go2_startup_XT16.launch.py"
+run_in_target "$SESSION:0.2" "source ~/ros2_ws/install/setup.bash ;ros2 launch go2_core go2_startup_XT16.launch.py"
 
 YOLO_CMD="python3 -u yolo_detect_client.py \
     --server-url http://127.0.0.1:5802/detect \
@@ -42,7 +43,8 @@ YOLO_CMD="python3 -u yolo_detect_client.py \
     --frame-stride 10 \
     --goal-standoff 0.5 \
     --map-frame map \
-    --base-link-frame base_link"
+    --base-link-frame base_link \
+    --webui-port 8083"
 run_in_target "$SESSION:0.3" "cd ~/yolo_deploy/ && $YOLO_CMD"
 
 # enter session

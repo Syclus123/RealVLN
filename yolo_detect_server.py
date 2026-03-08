@@ -45,6 +45,7 @@ import io
 import json
 import math
 import os
+import queue
 import signal
 import sys
 import time
@@ -70,6 +71,8 @@ from stream_vln import StreamProcessor, parse_vocab_arg
 print("[Server] 依赖加载完成")
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024   # 256 MB，防止整体请求过大
+app.config["MAX_FORM_MEMORY_SIZE"] = 64 * 1024 * 1024   # 64 MB，防止 Werkzeug 限制单个 form 字段大小
 
 # ── 全局运行时状态 ──────────────────────────────────────────────
 processor: StreamProcessor | None = None
@@ -231,6 +234,47 @@ def _generate_caption_for_root(rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, floa
         return None
 
 
+# ── Caption 异步队列 ─────────────────────────────────────────────
+
+_caption_queue: queue.Queue = queue.Queue()
+_caption_pending: set[int] = set()
+_caption_pending_lock = threading.Lock()
+
+
+def _enqueue_caption_task(track_id: int, class_name: str,
+                          rgb_bgr: np.ndarray,
+                          bbox_xyxy: tuple[float, float, float, float]) -> None:
+    with _caption_pending_lock:
+        if track_id in _caption_pending:
+            return
+        _caption_pending.add(track_id)
+    _caption_queue.put((track_id, class_name, rgb_bgr, bbox_xyxy))
+
+
+def _caption_worker() -> None:
+    while True:
+        item = _caption_queue.get()
+        if item is None:
+            break
+        track_id, class_name, rgb_bgr, bbox_xyxy = item
+        try:
+            caption = _generate_caption_for_root(rgb_bgr, bbox_xyxy, class_name)
+            if caption:
+                processor.set_caption(track_id, caption)
+                short = caption[:100] + "..." if len(caption) > 100 else caption
+                print(f"[Server] root_id={track_id} ({class_name}) caption: {short}")
+        except Exception as e:
+            print(f"[Server] caption worker error (root_id={track_id}): {e}")
+        finally:
+            with _caption_pending_lock:
+                _caption_pending.discard(track_id)
+            _caption_queue.task_done()
+
+
+_caption_thread = threading.Thread(target=_caption_worker, daemon=True)
+_caption_thread.start()
+
+
 # ── /detect 路由 ─────────────────────────────────────────────────
 @app.route("/detect", methods=["POST"])
 def detect():
@@ -284,23 +328,12 @@ def detect():
 
     results = processor.process_frame(rgb, depth, pose, frame_idx=frame_idx)
 
-    # 流式 caption：记录 root_id 新增/删除，对新增的用本帧该 root 的一张图生成 caption
-    current_root_ids = {r.track_id for r in results}
-    added_root_ids, removed_root_ids = processor.get_root_id_changes(current_root_ids)
-    if added_root_ids and _caption_enabled:
-        for root_id in added_root_ids:
-            match = next((r for r in results if r.track_id == root_id), None)
-            if match is None:
+    # 异步 caption：将需要生成 caption 的新 root_id 提交到后台线程
+    if _caption_enabled:
+        for r in results:
+            if processor.get_caption(r.track_id) is not None:
                 continue
-            caption = _generate_caption_for_root(rgb, match.bbox_xyxy, match.class_name)
-            if caption:
-                processor.set_caption(root_id, caption)
-                short = caption[:100] + "..." if len(caption) > 100 else caption
-                print(f"[Server] root_id={root_id} ({match.class_name}) caption: {short}")
-    for root_id in removed_root_ids:
-        if processor.get_caption(root_id) is not None:
-            processor.remove_caption(root_id)
-            print(f"[Server] root_id={root_id} 已消失，caption 已清除")
+            _enqueue_caption_task(r.track_id, r.class_name, rgb.copy(), r.bbox_xyxy)
 
     detections = []
     for r in results:
@@ -483,18 +516,22 @@ def _match_query_by_caption(user_query: str, captions: dict[int, str]) -> list[i
     用多模态 API（文本模式）从已有 caption 中找出与用户 query 最匹配的 root_id 列表。
     返回匹配的 root_id（按相关性排序），无匹配返回空列表。
     """
+    print("11111111")
     if not _caption_client or not captions:
+        print("22222222")
         return []
 
     candidates = "\n".join(f"- root_id={rid}: {cap}" for rid, cap in captions.items())
+    print(f"[debug] candidates: {candidates}")
     prompt = (
         f"用户想要找到的目标：{user_query}\n\n"
         f"以下是当前场景中已追踪到的物体及其描述：\n{candidates}\n\n"
-        "请从上面的列表中选出与用户描述最匹配的物体。"
+        "请从上面的列表中选出与用户描述最匹配的一个物体。"
         "如果没有任何匹配，输出 NONE。"
-        "只输出 root_id 数字，不要输出任何其他内容。"
+        "只输出一个 root_id 数字或 NONE，不要输出任何其他内容。"
     )
     for attempt in range(3):
+        print(f"[debug] attempt: {attempt}")
         try:
             resp = _caption_client.chat.completions.create(
                 model=os.environ.get("ARK_CAPTION_MODEL", "doubao-seed-2-0-mini-260215"),
@@ -502,17 +539,25 @@ def _match_query_by_caption(user_query: str, captions: dict[int, str]) -> list[i
                 # temperature=0.0,
                 # max_tokens=64,
             )
+            print(f"[debug] resp: {resp}")
             answer = (resp.choices[0].message.content or "").strip()
+            print(f"[debug] answer: {answer}")
             if answer.upper() == "NONE" or not answer:
                 return []
             result = []
-            for token in answer.replace(" ", "").split(","):
-                try:
-                    rid = int(token)
-                    if rid in captions:
-                        result.append(rid)
-                except ValueError:
-                    continue
+            rid = int(answer)
+            if rid in captions:
+                result.append(rid)
+            else:
+                raise ValueError(f"root_id {rid} not found in captions")
+            # assert int
+            # for token in answer:
+            #     try:
+            #         rid = int(token)
+            #         if rid in captions:
+            #             result.append(rid)
+            #     except ValueError:
+            #         continue
             return result
         except Exception as e:
             print(f"[Server] Caption 语义匹配失败 (尝试 {attempt + 1}/3): {e}")
