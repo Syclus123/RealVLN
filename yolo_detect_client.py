@@ -141,7 +141,7 @@ def call_query(
     class_name: str,
     robot_x: float,
     robot_y: float,
-    timeout: float = 10.0,
+    timeout: float = 100.0,
 ) -> dict:
     """
     查询 server 中指定类别的所有 track，按距机器人距离排序返回。

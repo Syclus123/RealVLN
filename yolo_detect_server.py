@@ -499,8 +499,8 @@ def _match_query_by_caption(user_query: str, captions: dict[int, str]) -> list[i
             resp = _caption_client.chat.completions.create(
                 model=os.environ.get("ARK_CAPTION_MODEL", "doubao-seed-2-0-mini-260215"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=64,
+                # temperature=0.0,
+                # max_tokens=64,
             )
             answer = (resp.choices[0].message.content or "").strip()
             if answer.upper() == "NONE" or not answer:

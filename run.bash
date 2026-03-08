@@ -137,6 +137,21 @@ python -u yolo_detect_server.py \
     --save-world-plot \
     --port 5802
 
+caption:
+export ARK_API_KEY=f622fb17-c76d-48d4-a184-17f52f7e41aa
+python -u yolo_detect_server.py \
+    --model yolov8x-worldv2.pt \
+    --vocab yolo_vocab/obj365v1_class_texts.json \
+    --conf 0.35 \
+    --cam-json cam_params.json \
+    --fusion moving_average --moving-avg-window 5 \
+    --merge-distance-thres 0.2 \
+    --output-dir ./output_realtime \
+    --save-vis \
+    --save-world-plot \
+    --port 5802 \
+    --enable-caption
+
 ---------------------------------------------------------
 Lidar
 
