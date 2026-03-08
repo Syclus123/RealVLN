@@ -61,6 +61,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
+from action_msgs.msg import GoalStatusArray, GoalStatus
 from sensor_msgs.msg import Image, LaserScan, PointCloud2
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -711,6 +712,7 @@ class YoloDetectNode(Node):
         odom_topic: str,
         goal_topic: str = "/goal_pose",
         marker_topic: str = "/yolo_detect/markers",
+        nav2_status_topic: str = "/navigate_to_pose/_action/status",
         lidar_topic: str | None = None,
         lidar_type: str = "laserscan",
     ):
@@ -768,6 +770,13 @@ class YoloDetectNode(Node):
         self.result_pub = self.create_publisher(String, "/yolo_detect/results", 10)
         self.goal_pub = self.create_publisher(PoseStamped, goal_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, marker_topic, 10)
+        self.nav2_status_sub = self.create_subscription(
+            GoalStatusArray,
+            nav2_status_topic,
+            self.nav2_status_callback,
+            qos_profile,
+        )
+        self._succeeded_goal_ids: set[tuple[int, ...]] = set()
 
         # TF2：用于获取 map→base_link 变换（比 odom 更准确）
         self.tf_buffer = Buffer()
@@ -786,7 +795,8 @@ class YoloDetectNode(Node):
         self.odom_timestamp = 0.0
 
         self.get_logger().info(
-            f"YoloDetectNode 已启动，goal_topic={goal_topic}, marker_topic={marker_topic}"
+            f"YoloDetectNode 已启动，goal_topic={goal_topic}, marker_topic={marker_topic}, "
+            f"nav2_status_topic={nav2_status_topic}"
         )
 
     # ------------------------------------------------------------------
@@ -1033,6 +1043,15 @@ class YoloDetectNode(Node):
         self.odom_timestamp = time.time()
         odom_rw_lock.release_write()
 
+    def nav2_status_callback(self, msg: GoalStatusArray) -> None:
+        """监听 Nav2 导航状态；若导航成功则打印“导航成功”。"""
+        for status_item in msg.status_list:
+            if status_item.status == GoalStatus.STATUS_SUCCEEDED:
+                goal_id = tuple(status_item.goal_info.goal_id.uuid)
+                if goal_id not in self._succeeded_goal_ids:
+                    self._succeeded_goal_ids.add(goal_id)
+                    print("导航成功")
+
 
 # -------------------------------------------
 # Main
@@ -1107,6 +1126,12 @@ if __name__ == "__main__":
         type=str,
         default="/yolo_detect/markers",
         help="发布检测结果可视化 MarkerArray 的话题（RViz2 订阅）",
+    )
+    parser.add_argument(
+        "--nav2-status-topic",
+        type=str,
+        default="/navigate_to_pose/_action/status",
+        help="Nav2 导航状态话题，监听成功状态（默认 /navigate_to_pose/_action/status）",
     )
     parser.add_argument(
         "--map-frame",
@@ -1205,6 +1230,7 @@ if __name__ == "__main__":
         f"  standoff={args.goal_standoff}m  z_offset={args.z_offset}m"
         f"  TF: {args.map_frame}→{args.base_link_frame}"
     )
+    print(f"[Client] Nav2 状态监听: topic={args.nav2_status_topic}")
     print(f"[Client] RViz 标记发布: marker_topic={args.marker_topic}  frame={args.map_frame}")
     if args.lidar_topic:
         print(
@@ -1257,6 +1283,7 @@ if __name__ == "__main__":
             odom_topic=args.odom_topic,
             goal_topic=args.goal_topic,
             marker_topic=args.marker_topic,
+            nav2_status_topic=args.nav2_status_topic,
             lidar_topic=args.lidar_topic,
             lidar_type=args.lidar_type,
         )
