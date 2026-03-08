@@ -205,7 +205,7 @@ def _generate_caption_for_root(rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, floa
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
     prompt = (
         "黄色边界框标出的是目标物体。"
-        "请用100个字左右描述该物体：类型、主要颜色、形状，以及它与周围物体或环境特征的空间关系（如放在桌上、靠近墙壁、旁边有货架等）。"
+        "请用50个字左右描述该物体：类型、主要颜色、形状，以及它与周围物体或环境特征的空间关系（如放在桌上、靠近墙壁、旁边有货架等）。"
         "禁止使用与视角相关的表述（如图片左侧、前景中），"
         "只使用物理空间关系词（如：上方、旁边、靠近）。"
     )
@@ -221,6 +221,8 @@ def _generate_caption_for_root(rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, floa
                     ],
                 }
             ],
+            temperature=0.0,
+            max_tokens=64,
         )
         text = (resp.choices[0].message.content or "").strip()
         return text if text else None
@@ -489,32 +491,35 @@ def _match_query_by_caption(user_query: str, captions: dict[int, str]) -> list[i
         f"用户想要找到的目标：{user_query}\n\n"
         f"以下是当前场景中已追踪到的物体及其描述：\n{candidates}\n\n"
         "请从上面的列表中选出与用户描述最匹配的物体。"
-        "只输出匹配物体的 root_id，用逗号分隔，按匹配度从高到低排列。"
         "如果没有任何匹配，输出 NONE。"
         "只输出 root_id 数字，不要输出任何其他内容。"
     )
-    try:
-        resp = _caption_client.chat.completions.create(
-            model=os.environ.get("ARK_CAPTION_MODEL", "doubao-seed-2-0-pro-260215"),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=64,
-        )
-        answer = (resp.choices[0].message.content or "").strip()
-        if answer.upper() == "NONE" or not answer:
-            return []
-        result = []
-        for token in answer.replace(" ", "").split(","):
-            try:
-                rid = int(token)
-                if rid in captions:
-                    result.append(rid)
-            except ValueError:
-                continue
-        return result
-    except Exception as e:
-        print(f"[Server] Caption 语义匹配失败: {e}")
-        return []
+    for attempt in range(3):
+        try:
+            resp = _caption_client.chat.completions.create(
+                model=os.environ.get("ARK_CAPTION_MODEL", "doubao-seed-2-0-mini-260215"),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=64,
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+            if answer.upper() == "NONE" or not answer:
+                return []
+            result = []
+            for token in answer.replace(" ", "").split(","):
+                try:
+                    rid = int(token)
+                    if rid in captions:
+                        result.append(rid)
+                except ValueError:
+                    continue
+            return result
+        except Exception as e:
+            print(f"[Server] Caption 语义匹配失败 (尝试 {attempt + 1}/3): {e}")
+            if attempt < 2:
+                import time
+                time.sleep(0.5)
+    return []
 
 
 @app.route("/query", methods=["POST"])
@@ -548,6 +553,7 @@ def query():
     """
     data = request.get_json(force=True, silent=True) or {}
     user_query = str(data.get("class_name", "")).strip()
+    print(f"[Server] user_query: {user_query}")
     robot_x = float(data.get("robot_x", 0.0))
     robot_y = float(data.get("robot_y", 0.0))
 
@@ -605,6 +611,10 @@ def query():
 
     if matches:
         matches.sort(key=lambda m: m["distance_to_robot"])
+    if len(matches) > 0:
+        print(f"[Server] success find the class name: {matches[0]['class_name']}")
+    else:
+        print(f"[Server] failed to find the class name")
 
     return jsonify({
         "class_name": user_query,

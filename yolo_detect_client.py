@@ -614,49 +614,7 @@ def interactive_thread(
             except Exception as e:
                 print(f"[Interactive] list 查询失败: {e}")
             continue
-
-        # ── 自然语言意图解析模式 ────────────────────────────────
-        query_class = user_input.lower()
-        if _is_natural_language(user_input):
-            if not has_deepseek:
-                print(
-                    "[Interactive] 检测到自然语言输入，但未配置 --deepseek-api-key，"
-                    "请直接输入英文类别名（如 chair）或添加 --deepseek-api-key 参数"
-                )
-                continue
-
-            # 获取当前已追踪的所有类别
-            try:
-                list_data = call_list_classes(base_url)
-                candidate_classes = list(list_data.get("classes", {}).keys())
-            except Exception as e:
-                print(f"[Interactive] 获取类别列表失败: {e}")
-                continue
-
-            if not candidate_classes:
-                print("[Interactive] 当前 server 中暂未追踪到任何物体，无法进行意图匹配")
-                continue
-
-            print(
-                f"[Interactive] 正在用 DeepSeek 解析意图：'{user_input}'\n"
-                f"              候选类别：{candidate_classes}"
-            )
-            matched = parse_intent_with_deepseek(
-                user_query=user_input,
-                candidate_classes=candidate_classes,
-                api_key=deepseek_api_key,
-                base_url=deepseek_base_url,
-                model=deepseek_model,
-            )
-            if matched is None:
-                print(
-                    f"[Interactive] DeepSeek 未能从候选类别中匹配到合适的物体，"
-                    f"请尝试直接输入类别名或修改描述"
-                )
-                continue
-
-            print(f"[Interactive] DeepSeek 解析结果：'{user_input}' → '{matched}'")
-            query_class = matched.lower()
+        query_class = user_input
 
         # ── 获取机器人当前位置：TF 优先，回退 odom ───────────────
         robot_x, robot_y = 0.0, 0.0
