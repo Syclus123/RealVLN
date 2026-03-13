@@ -172,6 +172,7 @@ _call_list_classes = None
 _call_query = None
 _parse_intent_with_deepseek = None
 _is_natural_language = None
+_go2_controller = None
 
 
 def bind_runtime_dependencies(
@@ -182,10 +183,12 @@ def bind_runtime_dependencies(
     call_query,
     parse_intent_with_deepseek,
     is_natural_language,
+    go2_controller=None,
 ) -> None:
     global _manager_getter, _odom_lock_getter
     global _call_list_classes, _call_query
     global _parse_intent_with_deepseek, _is_natural_language
+    global _go2_controller
 
     _manager_getter = manager_getter
     _odom_lock_getter = odom_lock_getter
@@ -193,6 +196,7 @@ def bind_runtime_dependencies(
     _call_query = call_query
     _parse_intent_with_deepseek = parse_intent_with_deepseek
     _is_natural_language = is_natural_language
+    _go2_controller = go2_controller
 
 
 # -------------------------------------------
@@ -343,3 +347,34 @@ def fetch_captions() -> dict:
         return resp.json()
     except Exception as e:
         return {"captions": {}, "error": str(e)}
+
+
+# -------------------------------------------
+# Go2 运动控制
+# -------------------------------------------
+def get_go2_controller():
+    return _go2_controller
+
+
+def handle_go2_action(action_name: str, angle: float | None = None) -> tuple[list[str], str | None]:
+    """
+    执行 Go2 运动控制动作。
+    返回: (messages, error)
+    """
+    if _go2_controller is None:
+        return [], "Go2 控制器未初始化（启动时未启用 --go2-interface）"
+
+    if not _go2_controller.is_ready:
+        return [], "Go2 控制器尚未就绪"
+
+    success, msg = _go2_controller.execute(action_name, angle=angle)
+    if success:
+        return [f"✓ {msg}"], None
+    else:
+        return [], msg
+
+
+def is_go2_action(text: str) -> bool:
+    """判断用户输入是否为 Go2 动作指令。"""
+    from go2_control import ACTIONS
+    return text.lower().strip() in ACTIONS

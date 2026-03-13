@@ -22,6 +22,7 @@ test wifi:
 nmcli device wifi list
 --------------------------------------------
 nav2:
+source ~/ros2_ws/install/setup.bash
 ros2 launch go2_core go2_startup_XT16.launch.py
 --------------------------------------------
 free:
@@ -38,7 +39,11 @@ python3 -u yolo_detect_client.py \
     --frame-stride 10 \
     --goal-standoff 0.5 \
     --map-frame map \
-    --base-link-frame base_link
+    --base-link-frame base_link \
+    --go2-interface eth0
+
+go2:
+--go2-interface eth0
 
 --------------------------------------------
 server:
@@ -151,6 +156,22 @@ python -u yolo_detect_server.py \
     --save-world-plot \
     --port 5802 \
     --enable-caption
+
+export ARK_API_KEY=f622fb17-c76d-48d4-a184-17f52f7e41aa
+python -u yolo_detect_server.py \
+    --model yolov8x-worldv2.pt \
+    --vocab basketball,soccer,tissue,toy,helmet,fish,carrot \
+    --conf 0.35 \
+    --cam-json cam_params.json \
+    --fusion moving_average --moving-avg-window 5 \
+    --merge-distance-thres 0.2 \
+    --output-dir ./output_realtime \
+    --save-vis \
+    --save-world-plot \
+    --port 5802 \
+    --enable-caption
+
+
 
 ---------------------------------------------------------
 Lidar

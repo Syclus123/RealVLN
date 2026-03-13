@@ -212,6 +212,66 @@ WEBUI_HTML = """<!DOCTYPE html>
     padding: 32px 16px;
   }
 
+  .go2-section {
+    background: #161b27;
+    border-bottom: 1px solid #2d3748;
+  }
+  .go2-toggle {
+    padding: 10px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: #161b27;
+    border: none;
+    border-bottom: 1px solid #2d3748;
+    width: 100%;
+    text-align: left;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .go2-toggle:hover { background: #1a2035; }
+  .go2-toggle .arrow { transition: transform 0.2s; font-size: 10px; margin-left: auto; color: #4a5568; }
+  .go2-toggle .arrow.open { transform: rotate(90deg); }
+  .go2-status-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #fc8181;
+    display: inline-block;
+  }
+  .go2-status-dot.ready { background: #48bb78; }
+  .go2-panel {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+  }
+  .go2-panel.open { max-height: 500px; }
+  .go2-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    padding: 10px 12px;
+  }
+  .go2-btn {
+    background: #1a2035;
+    border: 1px solid #2d3748;
+    border-radius: 6px;
+    padding: 8px 4px;
+    font-size: 11px;
+    color: #a0aec0;
+    cursor: pointer;
+    text-align: center;
+    transition: all 0.15s;
+    line-height: 1.3;
+  }
+  .go2-btn:hover { border-color: #ed8936; background: #1e2a45; color: #fbd38d; }
+  .go2-btn:active { transform: scale(0.95); }
+  .go2-btn.executing { border-color: #ed8936; background: #2d3748; color: #fbd38d; pointer-events: none; }
+  .go2-btn .btn-icon { font-size: 16px; display: block; margin-bottom: 2px; }
+  .go2-btn .btn-label { display: block; }
+
   .query-section {
     background: #161b27;
     border-top: 1px solid #2d3748;
@@ -386,11 +446,22 @@ WEBUI_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
+    <div class="go2-section" id="go2-section">
+      <button class="go2-toggle" onclick="toggleGo2Panel()">
+        &#x1F43E; Go2 运动控制
+        <span class="go2-status-dot" id="go2-status-dot"></span>
+        <span class="arrow" id="go2-arrow">&#x25B6;</span>
+      </button>
+      <div class="go2-panel" id="go2-panel">
+        <div class="go2-grid" id="go2-grid"></div>
+      </div>
+    </div>
+
     <div class="query-section">
       <div class="section-title">&#x1F4AC; 语义导航查询</div>
       <div class="query-log" id="query-log">
         <div class="log-entry info">
-          <span class="log-text">系统已就绪，输入目标类别或自然语言描述发布导航目标</span>
+          <span class="log-text">系统已就绪，输入目标类别/自然语言发布导航目标，或输入动作指令（如 turn_left）控制机器狗</span>
         </div>
       </div>
       <div class="quick-btns">
@@ -400,7 +471,7 @@ WEBUI_HTML = """<!DOCTYPE html>
         <button class="quick-btn" onclick="quickQuery('person')">person</button>
       </div>
       <div class="query-input-row">
-        <input id="query-input" type="text" placeholder="输入目标类别或自然语言（如：请找一把椅子）" />
+        <input id="query-input" type="text" placeholder="输入目标类别、自然语言，或动作指令（如 turn_left、stand_up）" />
         <button id="query-btn" onclick="submitQuery()">发送</button>
       </div>
     </div>
@@ -614,6 +685,80 @@ async function pollNavStatus() {
   finally { navPolling = false; }
 }
 setInterval(pollNavStatus, 800);
+
+const GO2_ICONS = {
+  stand_up: '🧍', stand_down: '🛌', move_forward: '⬆',
+  move_backward: '⬇', turn_left: '⬅', turn_right: '➡',
+  stop: '🛑', hello: '👋', sit: '🧘', stretch: '🤸',
+  recovery: '🔄', balance: '⚖', damp: '🛡',
+  move_lateral: '↔', handstand: '🤸', left_flip: '🔀',
+  back_flip: '🔄', free_walk: '🚶', free_bound: '🏃',
+  free_avoid: '🚧', walk_upright: '🧍', cross_step: '💃',
+  free_jump: '🏋',
+};
+
+let go2PanelOpen = false;
+let go2Actions = [];
+let go2Enabled = false;
+
+function toggleGo2Panel() {
+  go2PanelOpen = !go2PanelOpen;
+  document.getElementById('go2-panel').classList.toggle('open', go2PanelOpen);
+  document.getElementById('go2-arrow').classList.toggle('open', go2PanelOpen);
+  if (go2PanelOpen && go2Actions.length === 0) fetchGo2Actions();
+}
+
+async function fetchGo2Actions() {
+  try {
+    const resp = await fetch('/api/go2_actions');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    go2Actions = data.actions || [];
+    go2Enabled = data.enabled || false;
+    renderGo2Grid();
+    document.getElementById('go2-status-dot').classList.toggle('ready', go2Enabled);
+  } catch(e) {}
+}
+
+function renderGo2Grid() {
+  const grid = document.getElementById('go2-grid');
+  if (go2Actions.length === 0) {
+    grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;color:#4a5568;padding:12px;font-size:12px;">Go2 控制器未连接</div>';
+    return;
+  }
+  grid.innerHTML = go2Actions.map(a => {
+    const icon = GO2_ICONS[a.name] || '🤖';
+    return `<button class="go2-btn" id="go2-btn-${a.name}" onclick="execGo2('${a.name}')" title="${a.desc}"><span class="btn-icon">${icon}</span><span class="btn-label">${a.desc}</span></button>`;
+  }).join('');
+}
+
+async function execGo2(actionName) {
+  const btn = document.getElementById('go2-btn-' + actionName);
+  if (btn) btn.classList.add('executing');
+  addLog(`[Go2] ${actionName}`, 'user');
+  try {
+    const resp = await fetch('/api/go2_action', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: actionName})
+    });
+    const data = await resp.json();
+    if (data.error) {
+      addLog('[Go2] 错误: ' + data.error, 'error');
+    } else {
+      for (const line of (data.messages || [])) addLog('[Go2] ' + line, 'system');
+    }
+  } catch(e) {
+    addLog('[Go2] 请求失败: ' + e.message, 'error');
+  } finally {
+    if (btn) btn.classList.remove('executing');
+  }
+}
+
+fetchGo2Actions();
+setInterval(() => {
+  if (!go2PanelOpen) fetchGo2Actions();
+}, 10000);
 </script>
 </body>
 </html>
@@ -707,10 +852,45 @@ def webui_captions():
 def webui_query():
     data = flask_request.get_json(force=True, silent=True) or {}
     user_input = str(data.get("query", "")).strip()
+
+    if ws.is_go2_action(user_input):
+        messages, error = ws.handle_go2_action(user_input)
+        if error is not None:
+            return jsonify({"error": error}), 500 if "失败" in error else 400
+        return jsonify({"messages": messages})
+
     messages, error = ws.handle_query_request(user_input)
     if error is not None:
         return jsonify({"error": error}), 500 if "失败" in error else 400
     return jsonify({"messages": messages})
+
+
+@app.route("/api/go2_action", methods=["POST"])
+def webui_go2_action():
+    data = flask_request.get_json(force=True, silent=True) or {}
+    action_name = str(data.get("action", "")).strip()
+    angle = data.get("angle")
+    if angle is not None:
+        try:
+            angle = float(angle)
+        except (ValueError, TypeError):
+            angle = None
+    if not action_name:
+        return jsonify({"error": "action 不能为空"}), 400
+    messages, error = ws.handle_go2_action(action_name, angle=angle)
+    if error is not None:
+        return jsonify({"error": error}), 500 if "失败" in error else 400
+    return jsonify({"messages": messages})
+
+
+@app.route("/api/go2_actions", methods=["GET"])
+def webui_go2_actions_list():
+    from go2_control import get_action_list
+    controller = ws.get_go2_controller()
+    return jsonify({
+        "actions": get_action_list(),
+        "enabled": controller is not None and controller.is_ready,
+    })
 
 
 def start_webui(port: int) -> threading.Thread:

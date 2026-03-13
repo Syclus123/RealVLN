@@ -44,7 +44,8 @@ YOLO_CMD="python3 -u yolo_detect_client.py \
     --goal-standoff 0.5 \
     --map-frame map \
     --base-link-frame base_link \
-    --webui-port 8083"
+    --webui-port 8083 \
+    --go2-interface eth0"
 run_in_target "$SESSION:0.3" "cd ~/yolo_deploy/ && $YOLO_CMD"
 
 # enter session

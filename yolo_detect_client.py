@@ -1243,6 +1243,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--webui-port", type=int, default=8080)
     parser.add_argument("--no-webui", action="store_true")
+
+    parser.add_argument(
+        "--go2-interface",
+        type=str,
+        default=None,
+        help="Go2 机器狗网络接口（如 eth0），不指定则不启用运动控制",
+    )
     args = parser.parse_args()
 
     if args.cam_offset_x is not None:
@@ -1344,6 +1351,17 @@ if __name__ == "__main__":
             arrival_threshold=args.arrival_threshold,
         )
 
+        go2_ctrl = None
+        if args.go2_interface:
+            from go2_control import Go2Controller
+            go2_ctrl = Go2Controller(network_interface=args.go2_interface)
+            try:
+                go2_ctrl.init()
+                print(f"[Client] Go2 控制器已就绪（子进程模式），接口: {args.go2_interface}")
+            except Exception as e:
+                print(f"[Client] Go2 控制器初始化失败: {e}")
+                go2_ctrl = None
+
         ws.bind_runtime_dependencies(
             manager_getter=lambda: manager,
             odom_lock_getter=lambda: odom_rw_lock,
@@ -1351,6 +1369,7 @@ if __name__ == "__main__":
             call_query=call_query,
             parse_intent_with_deepseek=parse_intent_with_deepseek,
             is_natural_language=_is_natural_language,
+            go2_controller=go2_ctrl,
         )
 
         det_thread.start()
