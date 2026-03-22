@@ -2,3 +2,5 @@
 yolov8x-worldv2.pt
 yolo26x.pt
 output_realtime/
+Go2RealtimeAPI/master/RealtimeAPI-sdk-python-fork-v1/
+nohup.out*

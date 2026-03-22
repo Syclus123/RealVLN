@@ -516,9 +516,9 @@ def _match_query_by_caption(user_query: str, captions: dict[int, str]) -> list[i
     用多模态 API（文本模式）从已有 caption 中找出与用户 query 最匹配的 root_id 列表。
     返回匹配的 root_id（按相关性排序），无匹配返回空列表。
     """
-    print("11111111")
+    # print("11111111")
     if not _caption_client or not captions:
-        print("22222222")
+        # print("22222222")
         return []
 
     candidates = "\n".join(f"- root_id={rid}: {cap}" for rid, cap in captions.items())
@@ -730,7 +730,7 @@ if __name__ == "__main__":
     parser.add_argument("--cx", type=float, default=328.9)
     parser.add_argument("--cy", type=float, default=244.0)
     parser.add_argument("--cam-json", type=str, default=None)
-    parser.add_argument("--depth-scale", type=float, default=0.0001)
+    parser.add_argument("--depth-scale", type=float, default=0.001)
 
     # 跟踪
     parser.add_argument("--fusion", type=str, default="moving_average",

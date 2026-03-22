@@ -417,6 +417,180 @@ def _is_natural_language(text: str) -> bool:
     return False
 
 
+def _process_nav_query(
+    user_input: str,
+    base_url: str,
+    goal_standoff: float,
+    map_frame: str,
+    deepseek_api_key: str | None = None,
+    deepseek_base_url: str = "https://api.deepseek.com",
+    deepseek_model: str = "deepseek-chat",
+    tag: str = "Interactive",
+) -> None:
+    """Resolve user_input to a navigation goal and publish it."""
+    has_deepseek = bool(deepseek_api_key)
+    query_class = user_input
+
+    if _is_natural_language(user_input):
+        if not has_deepseek:
+            print(f"[{tag}] 未配置 DeepSeek API Key，无法解析自然语言")
+            return
+        try:
+            classes_data = call_list_classes(base_url)
+            candidate_classes = list(classes_data.get("classes", {}).keys())
+        except Exception as e:
+            print(f"[{tag}] 获取类别列表失败: {e}")
+            return
+
+        if not candidate_classes:
+            print(f"[{tag}] 暂无已追踪类别，无法进行意图解析")
+            return
+
+        print(f"[{tag}] 正在解析意图，候选类别: {', '.join(candidate_classes[:8])}...")
+        parsed = parse_intent_with_deepseek(
+            user_input, candidate_classes, deepseek_api_key, deepseek_base_url, deepseek_model,
+        )
+        if not parsed:
+            print(f"[{tag}] 意图解析失败")
+            return
+        query_class = parsed
+        print(f"[{tag}] 意图解析: '{user_input}' -> '{query_class}'")
+
+    robot_x, robot_y = 0.0, 0.0
+    if manager is not None:
+        odom_rw_lock.acquire_read()
+        odom_snapshot = copy.deepcopy(manager.odom)
+        odom_rw_lock.release_read()
+        if odom_snapshot is not None:
+            robot_x, robot_y = odom_snapshot[0], odom_snapshot[1]
+
+    try:
+        data = call_query(base_url, query_class, robot_x, robot_y)
+    except Exception as e:
+        print(f"[{tag}] 查询失败: {e}")
+        return
+
+    matches = data.get("matches", [])
+    if not matches:
+        print(f"[{tag}] 未找到类别 '{query_class}'")
+        return
+
+    chosen = matches[0]
+    pos = chosen["position"]
+    obj_x, obj_y, obj_z = pos[0], pos[1], pos[2]
+
+    dx = obj_x - robot_x
+    dy = obj_y - robot_y
+    dist = math.hypot(dx, dy)
+    if dist < 1e-6:
+        print(f"[{tag}] 机器人与目标几乎重合，跳过")
+        return
+
+    effective_standoff = max(0.0, float(goal_standoff))
+    target_dist = dist - effective_standoff if dist > effective_standoff else max(dist * 0.5, 0.1)
+    scale = target_dist / dist
+    goal_x = robot_x + dx * scale
+    goal_y = robot_y + dy * scale
+    yaw = math.atan2(dy, dx)
+
+    if manager is not None:
+        display_label = f"{user_input} → {query_class}" if query_class != user_input else query_class
+        manager.publish_goal(goal_x, goal_y, obj_z, yaw, frame_id=map_frame, target_name=display_label)
+        print(
+            f"[{tag}] ✓ 已发送目标 '{display_label}' track={chosen['track_id']}\n"
+            f"              goal=({goal_x:.3f}, {goal_y:.3f}, {obj_z:.3f})"
+            f" yaw={math.degrees(yaw):.1f}° dist={dist:.2f}m"
+        )
+    else:
+        print(f"[{tag}] ROS 节点未就绪，无法发布目标")
+
+
+def _process_control_action(action_name: str, params: dict | None = None) -> None:
+    """Execute a Go2 control action via the Go2Controller bound in webui_state."""
+    import webui_state as _ws
+
+    ctrl = _ws.get_go2_controller()
+    if ctrl is None:
+        print(f"[ASR] Go2 控制器未初始化，无法执行动作: {action_name}")
+        return
+
+    angle = None
+    if params:
+        angle = params.get("angle")
+
+    print(f"[ASR] 执行动作: {action_name}" + (f"  angle={angle}" if angle else ""))
+    success, msg = ctrl.execute(action_name, angle=angle)
+    if success:
+        print(f"[ASR] ✓ {msg}")
+    else:
+        print(f"[ASR] ✗ 动作失败: {msg}")
+
+
+def jsonl_watcher_thread(
+    jsonl_path: str,
+    base_url: str,
+    goal_standoff: float,
+    map_frame: str,
+    deepseek_api_key: str | None = None,
+    deepseek_base_url: str = "https://api.deepseek.com",
+    deepseek_model: str = "deepseek-chat",
+) -> None:
+    """Tail navigation.jsonl and dispatch navigation / control entries."""
+    import os
+
+    try:
+        offset = os.path.getsize(jsonl_path)
+    except OSError:
+        offset = 0
+
+    print(f"[ASR] 开始监控 {jsonl_path}（跳过已有 {offset} 字节）")
+
+    while True:
+        time.sleep(0.5)
+        try:
+            size = os.path.getsize(jsonl_path)
+        except OSError:
+            continue
+
+        if size <= offset:
+            continue
+
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                f.seek(offset)
+                new_data = f.read()
+            offset = size
+        except OSError as e:
+            print(f"[ASR] 读取文件失败: {e}")
+            continue
+
+        for line in new_data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            entry_type = entry.get("type", "navigation")
+            text = entry.get("original_text", "").strip()
+            if not text:
+                continue
+
+            if entry_type == "control":
+                action_name = entry.get("destination", text)
+                params = entry.get("parameters")
+                print(f"[ASR] 收到控制指令: {action_name}")
+                _process_control_action(action_name, params)
+            else:
+                print(f"[ASR] 收到导航指令: {text}")
+                _process_nav_query(
+                    text, base_url, goal_standoff, map_frame,
+                    deepseek_api_key, deepseek_base_url, deepseek_model, tag="ASR",
+                )
+
+
 def interactive_thread(
     base_url: str,
     goal_standoff: float,
@@ -475,122 +649,10 @@ def interactive_thread(
                 print(f"[Interactive] list 查询失败: {e}")
             continue
 
-        query_class = user_input
-
-        if _is_natural_language(user_input):
-            if not has_deepseek:
-                print("[Interactive] 未配置 DeepSeek API Key，无法解析自然语言")
-                continue
-            try:
-                classes_data = call_list_classes(base_url)
-                candidate_classes = list(classes_data.get("classes", {}).keys())
-            except Exception as e:
-                print(f"[Interactive] 获取类别列表失败: {e}")
-                candidate_classes = []
-
-            if not candidate_classes:
-                print("[Interactive] 暂无已追踪类别，无法进行意图解析")
-                continue
-
-            print(
-                f"[Interactive] 正在解析意图，候选类别: {', '.join(candidate_classes[:8])}..."
-            )
-            parsed = parse_intent_with_deepseek(
-                user_input,
-                candidate_classes,
-                deepseek_api_key,
-                deepseek_base_url,
-                deepseek_model,
-            )
-            if not parsed:
-                print("[Interactive] 意图解析失败")
-                continue
-            query_class = parsed
-            print(f"[Interactive] 意图解析: '{user_input}' -> '{query_class}'")
-
-        robot_x, robot_y = 0.0, 0.0
-        pos_source = "default(0,0)"
-        if manager is not None:
-            odom_rw_lock.acquire_read()
-            odom_snapshot = copy.deepcopy(manager.odom)
-            odom_rw_lock.release_read()
-            if odom_snapshot is not None:
-                robot_x, robot_y = odom_snapshot[0], odom_snapshot[1]
-                pos_source = "odom"
-
-        print(
-            f"[Interactive] 机器人位置: ({robot_x:.3f}, {robot_y:.3f}) 来源={pos_source}"
+        _process_nav_query(
+            user_input, base_url, goal_standoff, map_frame,
+            deepseek_api_key, deepseek_base_url, deepseek_model, tag="Interactive",
         )
-
-        try:
-            data = call_query(base_url, query_class, robot_x, robot_y)
-        except Exception as e:
-            print(f"[Interactive] 查询失败: {e}")
-            continue
-
-        matches = data.get("matches", [])
-        if not matches:
-            print(
-                f"[Interactive] 未找到类别 '{query_class}'，输入 'list' 查看已追踪物体"
-            )
-            continue
-
-        print(f"[Interactive] 查询 '{query_class}'，找到 {len(matches)} 个 track：")
-        for i, m in enumerate(matches):
-            pos = m["position"]
-            marker = "  ← 最近，已选" if i == 0 else ""
-            print(
-                f"  Track {m['class_name']} {m['track_id']:3d}: conf={m['mean_conf']:.2f}"
-                f"  dist={m['distance_to_robot']:.2f}m"
-                f"  pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})"
-                f"{marker}"
-            )
-
-        chosen = matches[0]
-        pos = chosen["position"]
-        obj_x, obj_y, obj_z = pos[0], pos[1], pos[2]
-
-        dx = obj_x - robot_x
-        dy = obj_y - robot_y
-        dist = math.hypot(dx, dy)
-        if dist < 1e-6:
-            print("[Interactive] 机器人与目标几乎重合，跳过")
-            continue
-
-        effective_standoff = max(0.0, float(goal_standoff))
-        if dist > effective_standoff:
-            target_dist = dist - effective_standoff
-        else:
-            target_dist = max(dist * 0.5, 0.1)
-
-        scale = target_dist / dist
-        goal_x = robot_x + dx * scale
-        goal_y = robot_y + dy * scale
-        goal_z = obj_z
-        yaw = math.atan2(dy, dx)
-
-        if manager is not None:
-            display_label = (
-                f"{user_input} → {query_class}"
-                if query_class != user_input
-                else query_class
-            )
-            manager.publish_goal(
-                goal_x,
-                goal_y,
-                goal_z,
-                yaw,
-                frame_id=map_frame,
-                target_name=display_label,
-            )
-            print(
-                f"[Interactive] ✓ 已发送目标 '{display_label}' track={chosen['track_id']}\n"
-                f"              goal=({goal_x:.3f}, {goal_y:.3f}, {goal_z:.3f})"
-                f" yaw={math.degrees(yaw):.1f}°"
-                f" dist={dist:.2f}m"
-            )
-        else:
-            print("[Interactive] ROS 节点未就绪，无法发布目标")
 
 
 # -------------------------------------------
@@ -1243,6 +1305,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--webui-port", type=int, default=8080)
     parser.add_argument("--no-webui", action="store_true")
+    parser.add_argument(
+        "--nav-log",
+        type=str,
+        default="nav_logs/navigation.jsonl",
+        help="ASR 导航日志文件路径，实时监控 original_text 字段作为导航指令",
+    )
 
     parser.add_argument(
         "--go2-interface",
@@ -1334,6 +1402,20 @@ if __name__ == "__main__":
         daemon=True,
     )
 
+    asr_thread = threading.Thread(
+        target=jsonl_watcher_thread,
+        args=(
+            args.nav_log,
+            server_base_url,
+            args.goal_standoff,
+            args.map_frame,
+            args.deepseek_api_key,
+            args.deepseek_base_url,
+            args.deepseek_model,
+        ),
+        daemon=True,
+    )
+
     rclpy.init()
     try:
         manager = YoloDetectNode(
@@ -1374,6 +1456,7 @@ if __name__ == "__main__":
 
         det_thread.start()
         iac_thread.start()
+        asr_thread.start()
 
         if not args.no_webui:
             ui_thread = start_webui(args.webui_port)

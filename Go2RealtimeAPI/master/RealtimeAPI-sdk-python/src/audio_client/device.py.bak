@@ -1,0 +1,62 @@
+import sounddevice as sd
+from typing import List
+
+
+# AUDIO DEVICE
+device_names = [
+    "default",
+    "8-mic Speakerphone: USB Audio (hw:0,0)",
+    "Jabra Link 370: USB Audio (hw:0,0)", # 
+    "Jabra SPEAK 510 USB: Audio (hw:0,0)" #
+    "ReSpeaker 4 Mic Array (UAC1.0): USB Audio (hw:2,0)"
+    ]
+
+input_device_names = [
+    "MacBook Pro麦克风"
+]
+input_device_names.extend(device_names)
+
+output_device_names = [
+    "MacBook Pro扬声器"
+]
+output_device_names.extend(device_names)
+
+def get_device_by_exact_name(exact_name: List[str], kind='any'):
+    devices = sd.query_devices()
+    for i, dev in enumerate(devices):
+        if kind == 'input' and dev['max_input_channels'] == 0:
+            continue
+        if kind == 'output' and dev['max_output_channels'] == 0:
+            continue
+        if dev['name'] in exact_name:
+            return i, dev['name']
+    raise ValueError(f"未找到名称完全匹配 '{exact_name}' 的设备")
+
+AUDIO_INPUT_DEVICE_ID, AUDIO_DEVICE_NAME = get_device_by_exact_name(input_device_names)
+AUDIO_OUTPUT_DEVICE_ID, _ = get_device_by_exact_name(output_device_names)
+
+if AUDIO_DEVICE_NAME.startswith("MacBook Pro"):
+    AUDIO_INPUT_DEVICE_CHANNALS = 1
+    AUDIO_OUTPUT_DEVICE_CHANNALS = 1
+    AUDIO_INPUT_SAMPLE_RATE = 16000
+    AUDIO_OUTPUT_SAMPLE_RATE = 16000
+
+elif AUDIO_DEVICE_NAME == "8-mic Speakerphone: USB Audio (hw:0,0)":
+    # HIKVISION
+    AUDIO_INPUT_DEVICE_CHANNALS = 2
+    AUDIO_OUTPUT_DEVICE_CHANNALS = 1
+    AUDIO_INPUT_SAMPLE_RATE = 48000
+    AUDIO_OUTPUT_SAMPLE_RATE = 48000
+
+else:
+    # JABRA
+    AUDIO_INPUT_DEVICE_CHANNALS = 1
+    AUDIO_OUTPUT_DEVICE_CHANNALS = 2
+    AUDIO_INPUT_SAMPLE_RATE = 16000
+    AUDIO_OUTPUT_SAMPLE_RATE = 48000
+
+# ReSpeaker 4 Mic Array (UAC1.0): USB Audio (hw:2,0)
+AUDIO_INPUT_SAMPLE_RATE = 16000
+AUDIO_OUTPUT_SAMPLE_RATE = 16000
+AUDIO_INPUT_DEVICE_CHANNALS = 6
+AUDIO_OUTPUT_DEVICE_CHANNALS = 2

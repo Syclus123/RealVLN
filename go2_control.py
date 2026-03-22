@@ -278,10 +278,14 @@ if __name__ == "__main__":
         print_actions()
         sys.exit(0)
 
-    # 每次执行新的动作前，先执行一次平衡站立（balance），
-    # 但如果本身就是 balance 则不重复执行。
-    if action != "balance":
-        # print("先执行一次基础平衡动作: balance")
+    # 动作前准备：机器狗可能处于坐姿（刚执行过 sit），此时 BalanceStand() 会报错 -1。
+    # - balance / stand_up / recovery：无需前置，直接执行。
+    # - sit：先 balance 再 sit（假定当前为站立）。
+    # - 其余动作（转向、移动等）：先 stand_up 再 balance，确保站立后再执行。
+    if action == "sit":
+        execute_action("balance", network_interface)
+    elif action not in ("balance", "stand_up", "recovery"):
+        execute_action("stand_up", network_interface)
         execute_action("balance", network_interface)
 
     execute_action(action, network_interface)

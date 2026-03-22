@@ -1,0 +1,17 @@
+{
+  "ws_url": "ws://183.47.116.239:13000/realtime",
+  "token": "R5NXpdgOFyAjyclSR6206NqB7z1DOFZr",
+  "agent_id": "hunyuan-turbos-latest",
+  "tone_id": "607240090",
+  "scene_type": "hunyuan-o",
+  "subtitle": true,
+  "stream_subtitle": true,
+  "business_id": 1,
+  "sample_rate": 16000,
+  "disable_greeting": true,
+  "channels": 1,
+  "bits_per_sample": 16,
+  "frame_duration_ms": 20,
+  "ping_interval_sec": 1.0,
+  "log_level": "INFO"
+}
