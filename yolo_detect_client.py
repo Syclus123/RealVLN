@@ -165,6 +165,7 @@ def parse_intent_with_deepseek(
         f"用户描述：{user_query}\n\n"
         f"候选类别列表：\n{candidates_str}\n\n"
         "请从上面的候选类别中选出最匹配的一个，直接输出类别名称："
+        "其中,helmet就是奥特曼的意思,如果用户要找奥特曼,直接匹配helmet. 其中,cup是纸杯的意思,如果用户要找纸杯,直接匹配cup."
     )
 
     headers = {
@@ -427,34 +428,36 @@ def _process_nav_query(
     deepseek_model: str = "deepseek-chat",
     tag: str = "Interactive",
 ) -> None:
-    """Resolve user_input to a navigation goal and publish it."""
-    has_deepseek = bool(deepseek_api_key)
+    """Resolve user_input to a navigation goal and publish it.
+
+    When DeepSeek is configured, tries client-side intent parsing first.
+    Otherwise, passes raw text directly to the server where caption-based
+    semantic matching (e.g. ARK/火山引擎) can handle natural language.
+    """
     query_class = user_input
 
-    if _is_natural_language(user_input):
-        if not has_deepseek:
-            print(f"[{tag}] 未配置 DeepSeek API Key，无法解析自然语言")
-            return
+    if _is_natural_language(user_input) and deepseek_api_key:
         try:
             classes_data = call_list_classes(base_url)
             candidate_classes = list(classes_data.get("classes", {}).keys())
         except Exception as e:
             print(f"[{tag}] 获取类别列表失败: {e}")
-            return
+            candidate_classes = []
 
-        if not candidate_classes:
-            print(f"[{tag}] 暂无已追踪类别，无法进行意图解析")
-            return
-
-        print(f"[{tag}] 正在解析意图，候选类别: {', '.join(candidate_classes[:8])}...")
-        parsed = parse_intent_with_deepseek(
-            user_input, candidate_classes, deepseek_api_key, deepseek_base_url, deepseek_model,
-        )
-        if not parsed:
-            print(f"[{tag}] 意图解析失败")
-            return
-        query_class = parsed
-        print(f"[{tag}] 意图解析: '{user_input}' -> '{query_class}'")
+        if candidate_classes:
+            print(f"[{tag}] 正在解析意图，候选类别: {', '.join(candidate_classes[:8])}...")
+            parsed = parse_intent_with_deepseek(
+                user_input, candidate_classes, deepseek_api_key, deepseek_base_url, deepseek_model,
+            )
+            if parsed:
+                query_class = parsed
+                print(f"[{tag}] 意图解析: '{user_input}' -> '{query_class}'")
+            else:
+                print(f"[{tag}] DeepSeek 意图解析失败，使用原始输入直接查询 server")
+        else:
+            print(f"[{tag}] 暂无已追踪类别，使用原始输入直接查询 server")
+    elif _is_natural_language(user_input):
+        print(f"[{tag}] 自然语言输入，将直接发送到 server 进行语义匹配")
 
     robot_x, robot_y = 0.0, 0.0
     if manager is not None:
@@ -526,6 +529,56 @@ def _process_control_action(action_name: str, params: dict | None = None) -> Non
         print(f"[ASR] ✗ 动作失败: {msg}")
 
 
+def _dispatch_jsonl_entry(
+    entry: dict,
+    base_url: str,
+    goal_standoff: float,
+    map_frame: str,
+    deepseek_api_key: str | None,
+    deepseek_base_url: str,
+    deepseek_model: str,
+) -> None:
+    """Parse a single JSONL entry and dispatch navigation or control action."""
+    entry_type = entry.get("type", "navigation")
+    text = entry.get("original_text", "").strip()
+    if not text:
+        return
+
+    if entry_type == "control":
+        action_name = entry.get("destination", text)
+        params = entry.get("parameters")
+        print(f"[ASR] 收到控制指令: {action_name}")
+        _process_control_action(action_name, params)
+    else:
+        print(f"[ASR] 收到导航指令: {text}")
+        _process_nav_query(
+            text, base_url, goal_standoff, map_frame,
+            deepseek_api_key, deepseek_base_url, deepseek_model, tag="ASR",
+        )
+
+
+def _read_last_line(filepath: str) -> str | None:
+    """Read the last non-empty line from a file efficiently."""
+    try:
+        with open(filepath, "rb") as f:
+            f.seek(0, 2)
+            fsize = f.tell()
+            if fsize == 0:
+                return None
+            buf = bytearray()
+            pos = fsize - 1
+            while pos >= 0:
+                f.seek(pos)
+                ch = f.read(1)
+                if ch == b"\n" and buf:
+                    break
+                buf.append(ch[0])
+                pos -= 1
+            return bytes(buf[::-1]).decode("utf-8").strip() or None
+    except OSError:
+        return None
+
+
 def jsonl_watcher_thread(
     jsonl_path: str,
     base_url: str,
@@ -538,12 +591,27 @@ def jsonl_watcher_thread(
     """Tail navigation.jsonl and dispatch navigation / control entries."""
     import os
 
+    # 启动时处理文件中已有的最后一行（如有）
+    last_line = _read_last_line(jsonl_path)
+    if last_line:
+        try:
+            entry = json.loads(last_line)
+            print(f"[ASR] 处理启动前已有的最后一条指令: {entry.get('original_text', '')}")
+            _dispatch_jsonl_entry(
+                entry, base_url, goal_standoff, map_frame,
+                deepseek_api_key, deepseek_base_url, deepseek_model,
+            )
+        except json.JSONDecodeError:
+            print(f"[ASR] 启动时最后一行 JSON 解析失败，跳过")
+    else:
+        print(f"[ASR] {jsonl_path} 为空或不存在，等待新指令")
+
     try:
         offset = os.path.getsize(jsonl_path)
     except OSError:
         offset = 0
 
-    print(f"[ASR] 开始监控 {jsonl_path}（跳过已有 {offset} 字节）")
+    print(f"[ASR] 开始监控 {jsonl_path}（从 {offset} 字节处开始）")
 
     while True:
         time.sleep(0.5)
@@ -552,8 +620,13 @@ def jsonl_watcher_thread(
         except OSError:
             continue
 
-        if size <= offset:
+        if size == offset:
             continue
+
+        # 文件被截断或重写，从头开始读取
+        if size < offset:
+            print(f"[ASR] 检测到文件截断（{offset} -> {size}字节），重置偏移量")
+            offset = 0
 
         try:
             with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -573,22 +646,10 @@ def jsonl_watcher_thread(
             except json.JSONDecodeError:
                 continue
 
-            entry_type = entry.get("type", "navigation")
-            text = entry.get("original_text", "").strip()
-            if not text:
-                continue
-
-            if entry_type == "control":
-                action_name = entry.get("destination", text)
-                params = entry.get("parameters")
-                print(f"[ASR] 收到控制指令: {action_name}")
-                _process_control_action(action_name, params)
-            else:
-                print(f"[ASR] 收到导航指令: {text}")
-                _process_nav_query(
-                    text, base_url, goal_standoff, map_frame,
-                    deepseek_api_key, deepseek_base_url, deepseek_model, tag="ASR",
-                )
+            _dispatch_jsonl_entry(
+                entry, base_url, goal_standoff, map_frame,
+                deepseek_api_key, deepseek_base_url, deepseek_model,
+            )
 
 
 def interactive_thread(
@@ -1308,7 +1369,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--nav-log",
         type=str,
-        default="nav_logs/navigation.jsonl",
+        default="Go2RealtimeAPI/master/RealtimeAPI-sdk-python/nav_logs/navigation.jsonl",
         help="ASR 导航日志文件路径，实时监控 original_text 字段作为导航指令",
     )
 

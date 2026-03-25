@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "unitree-sdk2py"
+version = "1.0.0"
+# 🌟 核心魔法：告诉打包工具，下面这些信息去 setup.py 里找，不要在这儿挑刺！
+dynamic =[
+    "description",
+    "readme",
+    "requires-python",
+    "license",
+    "authors",
+    "urls",
+    "dependencies"
+]

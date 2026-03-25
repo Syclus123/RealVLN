@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import time
+import json
+import threading
+import base64
+import re
+import cv2
+import numpy as np
+import requests
+
+# 导入宇树 SDK (替代低效的 subprocess)
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.go2.video.video_client import VideoClient
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+
+# ========== 核心参数 ==========
+NETWORK_INTERFACE = "eth0"
+OPENCLAW_API_URL = os.environ.get('OPENCLAW_API_URL', 'http://localhost:8080')
+# 👇 新增这行，把你在 OpenClaw 配置文件里的那个 Token 填进来
+OPENCLAW_API_KEY = os.environ.get('OPENCLAW_API_KEY', 'sk-QEZNDmcKYEDAzlH59N6szTo6Giwl3mHcdqKKunoUxcxGcjbX')
+
+MAX_SPEED = 0.4          # 最高直线速度
+MIN_SPEED = 0.1          # 探索速度
+MAX_VYAW = 0.6           # 最大转向速度
+VLM_INTERVAL = 2.0       # VLM 请求间隔（秒）
+
+# 状态共享字典 (大脑与小脑的通信桥梁)
+cmd_state = {
+    "target_vx": 0.0,
+    "target_vyaw": 0.0,
+    "last_vlm_time": time.time(), # 记录最后一次拿到分析结果的时间
+    "is_analyzing": False,
+    "danger_stop": False          # 紧急停止标志
+}
+
+def log(message):
+    print(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+# ==========================================
+# 🧠 大脑：VLM 异步感知线程
+# ==========================================
+def vlm_perception_thread(video_client):
+    log("🟢 [VLM 大脑] 异步视觉感知系统已启动...")
+    
+    prompt = """分析这张机器狗前方视角的照片，评估路况：
+请务必只返回JSON格式：
+{
+  "walkable": true/false,
+  "score": 1-5, 
+  "obstacles": ["障碍物1"],
+  "danger": true/false,
+  "action": "go_forward" / "turn_left" / "turn_right" / "stop",
+  "reason": "判断理由"
+}
+注意：狗高40cm，宽50cm。楼梯、大台阶是危险的。"""
+
+    while True:
+        try:
+            # 1. 直接从内存获取图像流，不写硬盘！
+            code, data = video_client.GetImageSample()
+            if code != 0:
+                time.sleep(0.1)
+                continue
+                
+            # 2. 内存解码与压缩 (降低网络传输延迟)
+            np_arr = np.frombuffer(bytes(data), np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            # 将图片缩放，VLM不需要太高分辨率，加速传输和推理
+            img_small = cv2.resize(img, (640, 480))
+            _, buffer = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            image_base64 = base64.b64encode(buffer).decode('utf-8')
+
+            # 3. 发送给 VLM
+            cmd_state["is_analyzing"] = True
+            log("⏳ 正在请求 VLM 分析当前路况...")
+           
+            # 👇 新增 headers 字典，构造 Bearer 鉴权头
+            headers = {
+                "Authorization": f"Bearer {OPENCLAW_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.post(
+                f"{OPENCLAW_API_URL}/v1/chat/completions",
+                headers=headers,  # <--- 把大门钥匙递过去
+                json={"image": image_base64, "prompt": prompt},
+                timeout=10.0
+            ) 
+            
+            if response.status_code == 200:
+                result_text = response.json().get('response', '')
+                
+                # 强健的 JSON 提取正则
+                json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+                if json_match:
+                    analysis = json.loads(json_match.group())
+                    
+                    # 4. 决策逻辑翻译为电机目标值
+                    danger = analysis.get("danger", False)
+                    action = analysis.get("action", "stop")
+                    score = analysis.get("score", 3)
+                    
+                    log(f"🧠 VLM决策: {action} | 评分: {score} | 理由: {analysis.get('reason', '')[:50]}")
+                    
+                    if danger or action == "stop":
+                        cmd_state["danger_stop"] = True
+                        cmd_state["target_vx"] = 0.0
+                        cmd_state["target_vyaw"] = 0.0
+                    else:
+                        cmd_state["danger_stop"] = False
+                        if action == "go_forward":
+                            cmd_state["target_vx"] = MAX_SPEED if score >= 4 else MIN_SPEED
+                            cmd_state["target_vyaw"] = 0.0
+                        elif action == "turn_left":
+                            cmd_state["target_vx"] = 0.0
+                            cmd_state["target_vyaw"] = MAX_VYAW
+                        elif action == "turn_right":
+                            cmd_state["target_vx"] = 0.0
+                            cmd_state["target_vyaw"] = -MAX_VYAW
+
+                    cmd_state["last_vlm_time"] = time.time()
+                else:
+                    log("⚠️ VLM 返回格式错误，未能提取 JSON")
+            else:
+                # 🔴 照妖镜在这里：把真实的 HTTP 报错打出来！
+                log(f"❌ VLM API 拒绝访问! 状态码: {response.status_code}, 内容: {response.text[:200]}")            
+        except Exception as e:
+            log(f"❌ VLM 请求异常: {e}")
+            cmd_state["target_vx"] = 0.0 # 异常时刹车保平安
+            
+        cmd_state["is_analyzing"] = False
+        time.sleep(VLM_INTERVAL) # 等待设定的间隔后再拍下一张
+
+# ==========================================
+# 🦴 小脑：高频运动控制线程
+# ==========================================
+def control_robot_thread(sport_client):
+    log("🟢 [电机小脑] 25Hz 柔性平滑控制已启动...")
+    real_vx, real_vyaw = 0.0, 0.0
+    S_VEL = 0.2  # 平滑系数
+    
+    # 确保站立
+    sport_client.StandUp()
+    time.sleep(1.0)
+    
+    try:
+        while True:
+            # 🚨 防盲走机制：如果超过 5 秒没有新的 VLM 结果，强制减速到停止
+            time_since_vlm = time.time() - cmd_state["last_vlm_time"]
+            if time_since_vlm > 5.0 or cmd_state["danger_stop"]:
+                t_vx, t_vyaw = 0.0, 0.0
+                if time_since_vlm > 5.0 and cmd_state["target_vx"] != 0:
+                    log("⚠️ 视觉信号陈旧，进入安全刹车状态...")
+                    cmd_state["target_vx"] = 0.0
+            else:
+                t_vx = cmd_state["target_vx"]
+                t_vyaw = cmd_state["target_vyaw"]
+
+            # 物理平滑过渡
+            real_vx += S_VEL * (t_vx - real_vx)
+            real_vyaw += S_VEL * (t_vyaw - real_vyaw)
+            
+            # 清除微小抖动
+            if abs(real_vx) < 0.02: real_vx = 0.0
+            if abs(real_vyaw) < 0.05: real_vyaw = 0.0
+
+            if real_vx == 0.0 and real_vyaw == 0.0:
+                sport_client.StopMove()
+            else:
+                sport_client.Move(real_vx, 0.0, real_vyaw)
+            
+            time.sleep(0.04) # 严格维持 25Hz 发送频率，防止断连
+            
+    except Exception as e:
+        log(f"❌ 控制线程崩溃: {e}")
+    finally:
+        sport_client.StopMove()
+
+# ==========================================
+# 主程序入口
+# ==========================================
+def main():
+    log("=" * 60)
+    log("🐕 Go2 Auto Walk PRO - 多线程异步感知版")
+    log("=" * 60)
+    
+    ChannelFactoryInitialize(0, NETWORK_INTERFACE)
+    
+    video_client = VideoClient()
+    video_client.Init()
+    
+    sport_client = SportClient()
+    sport_client.Init()
+    
+    # 启动双核驱动
+    threading.Thread(target=vlm_perception_thread, args=(video_client,), daemon=True).start()
+    threading.Thread(target=control_robot_thread, args=(sport_client,), daemon=True).start()
+    
+    try:
+        while True:
+            # 主线程可以用来做状态监控或其他宏观管理
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log("\n🛑 收到退出信号，安全降落中...")
+        sport_client.StopMove()
+        time.sleep(0.5)
+
+if __name__ == "__main__":
+    main()

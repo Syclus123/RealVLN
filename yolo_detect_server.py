@@ -71,8 +71,10 @@ from stream_vln import StreamProcessor, parse_vocab_arg
 print("[Server] 依赖加载完成")
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024   # 256 MB，防止整体请求过大
-app.config["MAX_FORM_MEMORY_SIZE"] = 64 * 1024 * 1024   # 64 MB，防止 Werkzeug 限制单个 form 字段大小
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 256 MB，防止整体请求过大
+app.config["MAX_FORM_MEMORY_SIZE"] = (
+    64 * 1024 * 1024
+)  # 64 MB，防止 Werkzeug 限制单个 form 字段大小
 
 # ── 全局运行时状态 ──────────────────────────────────────────────
 processor: StreamProcessor | None = None
@@ -82,7 +84,7 @@ start_time: float = time.time()
 # ── 保存模式配置（由 main 写入） ─────────────────────────────────
 output_dir: Path | None = None
 save_vis: bool = False
-save_world_plot_flag: bool = False 
+save_world_plot_flag: bool = False
 world_plot_min_points: int = 3
 
 # ── Caption：新增 root_id 时选一张图生成描述（可选）
@@ -113,15 +115,32 @@ def _init_save_mode(out_dir: Path, do_vis: bool) -> None:
     csv_path = out_dir / "detections.csv"
     _csv_file = csv_path.open("w", newline="", encoding="utf-8")
     _csv_writer = csv.writer(_csv_file)
-    _csv_writer.writerow([
-        "frame_idx", "frame_name",
-        "track_id", "cls_id", "class_name", "confidence",
-        "u", "v", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-        "depth_m",
-        "x_cam", "y_cam", "z_cam",
-        "x_world_raw", "y_world_raw", "z_world_raw",
-        "x_world_fused", "y_world_fused", "z_world_fused",
-    ])
+    _csv_writer.writerow(
+        [
+            "frame_idx",
+            "frame_name",
+            "track_id",
+            "cls_id",
+            "class_name",
+            "confidence",
+            "u",
+            "v",
+            "bbox_x1",
+            "bbox_y1",
+            "bbox_x2",
+            "bbox_y2",
+            "depth_m",
+            "x_cam",
+            "y_cam",
+            "z_cam",
+            "x_world_raw",
+            "y_world_raw",
+            "z_world_raw",
+            "x_world_fused",
+            "y_world_fused",
+            "z_world_fused",
+        ]
+    )
     _csv_file.flush()
     print(f"[Server] CSV 保存至: {csv_path}")
 
@@ -151,22 +170,30 @@ def _close_save_mode() -> None:
     """Server 退出时调用：关闭 CSV，可选生成轨迹图。"""
     if output_dir is not None:
         with _track_frames_lock:
-            snapshot = {tid: sorted(list(frames)) for tid, frames in _track_frames.items()}
-            snapshot_names = {tid: sorted(list(names)) for tid, names in _track_frame_names.items()}
+            snapshot = {
+                tid: sorted(list(frames)) for tid, frames in _track_frames.items()
+            }
+            snapshot_names = {
+                tid: sorted(list(names)) for tid, names in _track_frame_names.items()
+            }
         if snapshot:
             tf_csv_path = output_dir / "track_frame_ids.csv"
             with tf_csv_path.open("w", newline="", encoding="utf-8") as tf_csv:
                 writer = csv.writer(tf_csv)
-                writer.writerow(["track_id", "num_frames", "frame_indices", "frame_names"])
+                writer.writerow(
+                    ["track_id", "num_frames", "frame_indices", "frame_names"]
+                )
                 for tid in sorted(snapshot.keys()):
                     frames = snapshot[tid]
                     frame_names = snapshot_names.get(tid, [])
-                    writer.writerow([
-                        tid,
-                        len(frames),
-                        " ".join(str(x) for x in frames),
-                        " ".join(frame_names),
-                    ])
+                    writer.writerow(
+                        [
+                            tid,
+                            len(frames),
+                            " ".join(str(x) for x in frames),
+                            " ".join(frame_names),
+                        ]
+                    )
             print(f"[Server] Track-Frame 汇总保存至: {tf_csv_path}")
 
     if _csv_file is not None and not _csv_file.closed:
@@ -185,17 +212,33 @@ def _close_save_mode() -> None:
 
 
 # ── Caption 生成（新增 root_id 时在完整帧上只标注该目标的 bbox）───
-def _draw_single_bbox(rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, float, float, float], class_name: str) -> np.ndarray:
+def _draw_single_bbox(
+    rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, float, float, float], class_name: str
+) -> np.ndarray:
     """在原始 RGB 上只画一个目标的黄色 bbox + 类名标签，返回副本。"""
     canvas = rgb_bgr.copy()
-    x1, y1, x2, y2 = int(round(bbox_xyxy[0])), int(round(bbox_xyxy[1])), int(round(bbox_xyxy[2])), int(round(bbox_xyxy[3]))
+    x1, y1, x2, y2 = (
+        int(round(bbox_xyxy[0])),
+        int(round(bbox_xyxy[1])),
+        int(round(bbox_xyxy[2])),
+        int(round(bbox_xyxy[3])),
+    )
     cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 255), 2)
-    cv2.putText(canvas, class_name, (max(5, x1), max(20, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    cv2.putText(
+        canvas,
+        class_name,
+        (max(5, x1), max(20, y1 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2,
+    )
     return canvas
 
 
-def _generate_caption_for_root(rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, float, float, float], class_name: str) -> str | None:
+def _generate_caption_for_root(
+    rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, float, float, float], class_name: str
+) -> str | None:
     """
     在完整帧上只标注该 root 的 bbox，调用多模态 API 生成一句与视角无关的物体描述。
     保留完整场景以提供环境上下文，单一标注确保模型知道描述哪个目标。
@@ -219,7 +262,10 @@ def _generate_caption_for_root(rgb_bgr: np.ndarray, bbox_xyxy: tuple[float, floa
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                        },
                         {"type": "text", "text": prompt},
                     ],
                 }
@@ -241,9 +287,12 @@ _caption_pending: set[int] = set()
 _caption_pending_lock = threading.Lock()
 
 
-def _enqueue_caption_task(track_id: int, class_name: str,
-                          rgb_bgr: np.ndarray,
-                          bbox_xyxy: tuple[float, float, float, float]) -> None:
+def _enqueue_caption_task(
+    track_id: int,
+    class_name: str,
+    rgb_bgr: np.ndarray,
+    bbox_xyxy: tuple[float, float, float, float],
+) -> None:
     with _caption_pending_lock:
         if track_id in _caption_pending:
             return
@@ -347,12 +396,14 @@ def detect():
         wf = det.get("world_fused", None)
         if wf is None or len(wf) != 3:
             continue
-        objects_world.append({
-            "track_id": int(det.get("track_id", -1)),
-            "class_name": str(det.get("class_name", "")),
-            "world": [float(wf[0]), float(wf[1]), float(wf[2])],
-            "confidence": float(det.get("confidence", 0.0)),
-        })
+        objects_world.append(
+            {
+                "track_id": int(det.get("track_id", -1)),
+                "class_name": str(det.get("class_name", "")),
+                "world": [float(wf[0]), float(wf[1]), float(wf[2])],
+                "confidence": float(det.get("confidence", 0.0)),
+            }
+        )
 
     with _latest_objects_lock:
         global _latest_objects, _latest_frame_name, _latest_frame_idx
@@ -386,16 +437,32 @@ def detect():
                 wr = det["world_raw"]
                 wf = det["world_fused"]
                 tid = int(det["track_id"])
-                _csv_writer.writerow([
-                    frame_idx, frame_name,
-                    tid, det["cls_id"], det["class_name"], det["confidence"],
-                    det["u"], det["v"],
-                    bbox[0], bbox[1], bbox[2], bbox[3],
-                    det["depth_m"],
-                    cam[0], cam[1], cam[2],
-                    wr[0], wr[1], wr[2],
-                    wf[0], wf[1], wf[2],
-                ])
+                _csv_writer.writerow(
+                    [
+                        frame_idx,
+                        frame_name,
+                        tid,
+                        det["cls_id"],
+                        det["class_name"],
+                        det["confidence"],
+                        det["u"],
+                        det["v"],
+                        bbox[0],
+                        bbox[1],
+                        bbox[2],
+                        bbox[3],
+                        det["depth_m"],
+                        cam[0],
+                        cam[1],
+                        cam[2],
+                        wr[0],
+                        wr[1],
+                        wr[2],
+                        wf[0],
+                        wf[1],
+                        wf[2],
+                    ]
+                )
                 with _track_frames_lock:
                     if tid not in _track_frames:
                         _track_frames[tid] = set()
@@ -416,14 +483,16 @@ def detect():
 
     frame_idx += 1
 
-    return jsonify({
-        "frame_idx": frame_idx - 1,
-        "frame_name": frame_name,
-        "num_detections": len(detections),
-        "detections": detections,
-        "objects_world": objects_world,
-        "inference_time": inference_time,
-    })
+    return jsonify(
+        {
+            "frame_idx": frame_idx - 1,
+            "frame_name": frame_name,
+            "num_detections": len(detections),
+            "detections": detections,
+            "objects_world": objects_world,
+            "inference_time": inference_time,
+        }
+    )
 
 
 # ── 其他路由 ─────────────────────────────────────────────────────
@@ -448,11 +517,13 @@ def tracks():
         if k in captions:
             out["caption"] = captions[k]
         tracks_out[str(k)] = out
-    return jsonify({
-        "frame_count": processor.frame_count,
-        "num_tracks": len(summaries),
-        "tracks": tracks_out,
-    })
+    return jsonify(
+        {
+            "frame_count": processor.frame_count,
+            "num_tracks": len(summaries),
+            "tracks": tracks_out,
+        }
+    )
 
 
 @app.route("/captions", methods=["GET"])
@@ -469,7 +540,9 @@ def save_plot():
         return jsonify({"error": "output_dir not set, use --output-dir"}), 400
     plot_path = output_dir / "world_tracks.png"
     try:
-        processor.save_world_plot(str(plot_path), source="fused", min_points=world_plot_min_points)
+        processor.save_world_plot(
+            str(plot_path), source="fused", min_points=world_plot_min_points
+        )
         return jsonify({"status": "ok", "path": str(plot_path)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -479,6 +552,7 @@ def save_plot():
 def world_plot():
     """生成并返回世界坐标系俯视轨迹图 (PNG)，实时下载。"""
     import tempfile
+
     source = request.args.get("source", "fused")
     min_pts = int(request.args.get("min_points", str(world_plot_min_points)))
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -534,7 +608,9 @@ def _match_query_by_caption(user_query: str, captions: dict[int, str]) -> list[i
         print(f"[debug] attempt: {attempt}")
         try:
             resp = _caption_client.chat.completions.create(
-                model=os.environ.get("ARK_CAPTION_MODEL", "doubao-seed-2-0-mini-260215"),
+                model=os.environ.get(
+                    "ARK_CAPTION_MODEL", "doubao-seed-2-0-mini-260215"
+                ),
                 messages=[{"role": "user", "content": prompt}],
                 # temperature=0.0,
                 # max_tokens=64,
@@ -563,6 +639,7 @@ def _match_query_by_caption(user_query: str, captions: dict[int, str]) -> list[i
             print(f"[Server] Caption 语义匹配失败 (尝试 {attempt + 1}/3): {e}")
             if attempt < 2:
                 import time
+
                 time.sleep(0.5)
     return []
 
@@ -636,12 +713,14 @@ def query():
 
     if matches:
         matches.sort(key=lambda m: m["distance_to_robot"])
-        return jsonify({
-            "class_name": user_query,
-            "match_mode": "exact",
-            "num_matches": len(matches),
-            "matches": matches,
-        })
+        return jsonify(
+            {
+                "class_name": user_query,
+                "match_mode": "exact",
+                "num_matches": len(matches),
+                "matches": matches,
+            }
+        )
 
     # 2) 基于 caption 的语义匹配（需 --enable-caption 且有 caption 数据）
     if _caption_enabled and captions:
@@ -661,12 +740,14 @@ def query():
     else:
         print(f"[Server] failed to find the class name")
 
-    return jsonify({
-        "class_name": user_query,
-        "match_mode": "caption" if matches else "none",
-        "num_matches": len(matches),
-        "matches": matches,
-    })
+    return jsonify(
+        {
+            "class_name": user_query,
+            "match_mode": "caption" if matches else "none",
+            "num_matches": len(matches),
+            "matches": matches,
+        }
+    )
 
 
 @app.route("/list_classes", methods=["GET"])
@@ -677,11 +758,13 @@ def list_classes():
     for info in summaries.values():
         cn = info["class_name"]
         class_counts[cn] = class_counts.get(cn, 0) + 1
-    return jsonify({
-        "frame_count": processor.frame_count,
-        "total_tracks": len(summaries),
-        "classes": class_counts,
-    })
+    return jsonify(
+        {
+            "frame_count": processor.frame_count,
+            "total_tracks": len(summaries),
+            "classes": class_counts,
+        }
+    )
 
 
 @app.route("/latest_objects", methods=["GET"])
@@ -692,23 +775,27 @@ def latest_objects():
         fidx = _latest_frame_idx
         fname = _latest_frame_name
 
-    return jsonify({
-        "frame_idx": fidx,
-        "frame_name": fname,
-        "num_objects": len(objs),
-        "objects_world": objs,
-    })
+    return jsonify(
+        {
+            "frame_idx": fidx,
+            "frame_name": fname,
+            "num_objects": len(objs),
+            "objects_world": objs,
+        }
+    )
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "frame_count": processor.frame_count,
-        "output_dir": str(output_dir) if output_dir else None,
-        "save_vis": save_vis,
-        "save_world_plot": save_world_plot_flag,
-    })
+    return jsonify(
+        {
+            "status": "ok",
+            "frame_count": processor.frame_count,
+            "output_dir": str(output_dir) if output_dir else None,
+            "save_vis": save_vis,
+            "save_world_plot": save_world_plot_flag,
+        }
+    )
 
 
 # ── Main ─────────────────────────────────────────────────────────
@@ -719,7 +806,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="yolov8s-world.pt")
     parser.add_argument("--conf", type=float, default=0.4)
     parser.add_argument(
-        "--vocab", type=str, default=None,
+        "--vocab",
+        type=str,
+        default=None,
         help="YOLO-World 词表：逗号分隔字符串、txt 文件路径、或 JSON 文件路径（如 yolo_vocab/obj365v1_class_texts.json）",
     )
     parser.add_argument("--classes", type=str, default=None)
@@ -733,8 +822,12 @@ if __name__ == "__main__":
     parser.add_argument("--depth-scale", type=float, default=0.001)
 
     # 跟踪
-    parser.add_argument("--fusion", type=str, default="moving_average",
-                        choices=["none", "moving_average", "kalman"])
+    parser.add_argument(
+        "--fusion",
+        type=str,
+        default="moving_average",
+        choices=["none", "moving_average", "kalman"],
+    )
     parser.add_argument("--moving-avg-window", type=int, default=5)
     parser.add_argument("--track-iou-thres", type=float, default=0.3)
     parser.add_argument("--track-max-miss", type=int, default=8)
@@ -747,7 +840,9 @@ if __name__ == "__main__":
 
     # ── 保存模式 ─────────────────────────────────────────────────
     parser.add_argument(
-        "--output-dir", type=str, default=None,
+        "--output-dir",
+        type=str,
+        default=None,
         help=(
             "开启保存模式，指定输出目录（自动用时间戳命名子目录）。"
             "将持续写入 detections.csv；"
@@ -756,19 +851,24 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--save-vis", action="store_true",
+        "--save-vis",
+        action="store_true",
         help="逐帧保存标注后 RGB 和深度图（需 --output-dir）",
     )
     parser.add_argument(
-        "--save-world-plot", action="store_true",
+        "--save-world-plot",
+        action="store_true",
         help="Ctrl+C 退出时自动保存世界坐标俯视轨迹图（需 --output-dir）",
     )
     parser.add_argument(
-        "--world-plot-min-points", type=int, default=3,
+        "--world-plot-min-points",
+        type=int,
+        default=3,
         help="轨迹图最少点数阈值",
     )
     parser.add_argument(
-        "--enable-caption", action="store_true",
+        "--enable-caption",
+        action="store_true",
         help="对新增的 root_id 用本帧裁剪图调用多模态 API 生成 caption；需环境变量 ARK_API_KEY（可选 ARK_BASE_URL、ARK_CAPTION_MODEL）",
     )
 
@@ -802,8 +902,11 @@ if __name__ == "__main__":
         ark_key = os.environ.get("ARK_API_KEY")
         if ark_key:
             from openai import OpenAI
+
             _caption_client = OpenAI(
-                base_url=os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
+                base_url=os.environ.get(
+                    "ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"
+                ),
                 api_key=ark_key,
             )
             print("[Server] Caption 已开启（豆包/方舟多模态 API）")

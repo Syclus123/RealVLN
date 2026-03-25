@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import time
+import cv2
+import numpy as np
+import threading
+import argparse
+from ultralytics import YOLO
+
+# 导入宇树 SDK
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.go2.video.video_client import VideoClient
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+
+# 语音技能
+sys.path.insert(0, '/home/unitree/openclaw/skills/go2-audio-play/scripts')
+from play import play_sound
+
+# ==========================================
+# 🛠️ 核心参数 (Track 优化版)
+# ==========================================
+NETWORK_INTERFACE = "eth0"
+MODEL_PATH = '/home/unitree/openclaw/skills/unitree-go2/yolov8n.pt'
+SOUND_PATH = '/home/unitree/openclaw/skills/go2-audio-play/sounds/dog_barking.wav'
+
+# 动力增益
+VYAW_GAIN = 3.2           # 🚀 极速转向响应
+POUNCE_PITCH = 0.45       # 强力前压
+RAISE_PITCH = -0.25       # 强力后仰
+RETREAT_SPEED = -0.18     # 连续退步速度
+
+cmd_state = {
+    "vx": 0.0,
+    "vyaw": 0.0,
+    "pitch": 0.0,
+    "is_barking_now": False, 
+    "active": False,
+    "last_update": 0.0
+}
+
+bark_event = threading.Event()
+
+# ==========================================
+# 1. 音频与姿态联动
+# ==========================================
+def audio_worker_thread():
+    while True:
+        if bark_event.is_set():
+            cmd_state["is_barking_now"] = True
+            play_sound(SOUND_PATH)
+            time.sleep(0.4) 
+            cmd_state["is_barking_now"] = False
+            time.sleep(1.0) 
+            bark_event.clear()
+        else:
+            time.sleep(0.01)
+
+# ==========================================
+# 2. 运动控制线程 (高优先级连续指令)
+# ==========================================
+def control_thread_task(sport_client):
+    print("🟢 [控制线程] 正在以 25Hz 维持连续步态...")
+    S_VEL = 0.35   # 速度平滑度
+    S_PITCH = 0.02 # 姿态步进限制
+    
+    real_vx, real_vyaw, real_pitch = 0.0, 0.0, 0.0
+    
+    try:
+        while True:
+            # 只有在完全失去目标超过 0.5s 后才归零
+            if not cmd_state["active"] or (time.time() - cmd_state["last_update"] > 0.5):
+                t_vx, t_vyaw, t_pitch = 0.0, 0.0, 0.0
+            else:
+                t_vx = cmd_state["vx"]
+                t_vyaw = cmd_state["vyaw"]
+                t_pitch = RAISE_PITCH if cmd_state["is_barking_now"] else cmd_state["pitch"]
+
+            # 物理平滑平滑
+            real_vx += S_VEL * (t_vx - real_vx)
+            real_vyaw += S_VEL * (t_vyaw - real_vyaw)
+            
+            # Pitch 柔性步进
+            diff_p = t_pitch - real_pitch
+            if abs(diff_p) > S_PITCH:
+                real_pitch += np.sign(diff_p) * S_PITCH
+            else:
+                real_pitch = t_pitch
+
+            # 核心执行：必须保证指令的连续性，防止踏步中断
+            if abs(real_vx) > 0.02 or abs(real_vyaw) > 0.05 or abs(real_pitch) > 0.01:
+                sport_client.Move(real_vx, 0.0, real_vyaw)
+                sport_client.Euler(0.0, real_pitch, 0.0)
+            else:
+                # 只有静止状态且无姿态要求时才停止
+                sport_client.StopMove()
+                sport_client.Euler(0, 0, 0)
+            
+            time.sleep(0.04) # 25Hz 维持保活
+    except Exception as e:
+        print(f"❌ [控制线程] 异常: {e}")
+
+# ==========================================
+# 3. 决策大脑 (保留 model.track)
+# ==========================================
+def main():
+    ChannelFactoryInitialize(0, NETWORK_INTERFACE)
+    video_client = VideoClient()
+    video_client.Init()
+    sport_client = SportClient()
+    sport_client.Init()
+
+    model = YOLO(MODEL_PATH)
+    # 预热 YOLO
+    model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+
+    threading.Thread(target=audio_worker_thread, daemon=True).start()
+    threading.Thread(target=control_thread_task, args=(sport_client,), daemon=True).start()
+
+    print("\n🐕 Guard Dog V5-Track: 追踪保活模式激活！")
+    
+    try:
+        while True:
+            code, data = video_client.GetImageSample()
+            if code != 0: continue
+            
+            img = cv2.imdecode(np.frombuffer(bytes(data), np.uint8), cv2.IMREAD_COLOR)
+            # 使用 model.track 保持目标 ID 稳定性
+            results = model.track(img, classes=[0], conf=0.35, persist=True, tracker="botsort.yaml", verbose=False)
+            
+            v_x, v_yaw, p_pitch = 0.0, 0.0, 0.0
+            
+            # 即使追踪器还没分配 ID，只要检测框里有人，我们也立即锁定
+            if len(results[0].boxes) > 0:
+                cmd_state["active"] = True
+                cmd_state["last_update"] = time.time()
+                
+                # 逻辑：如果有 ID，选最大的 ID 框；如果没 ID，选最大的检测框
+                boxes_data = results[0].boxes.xyxy.cpu().numpy()
+                areas = (boxes_data[:,2]-boxes_data[:,0])*(boxes_data[:,3]-boxes_data[:,1])
+                idx = np.argmax(areas)
+                x1, y1, x2, y2 = boxes_data[idx]
+                
+                # 计算偏差
+                h_err = ((x1 + x2) / (2 * img.shape[1]) - 0.5) * 2
+                v_yaw = -h_err * VYAW_GAIN 
+                
+                # 距离线性插值
+                dist = np.interp(y2 / img.shape[0], [0.70, 0.85, 0.95], [3.0, 1.5, 0.5])
+
+                if dist < 2.0:
+                    bark_event.set()
+                    p_pitch = POUNCE_PITCH
+                    if dist < 1.0:
+                        v_x = RETREAT_SPEED # 触发连续踏步后退
+                
+                print(f"\r\033[K🚨 锁定目标 [ID: {results[0].boxes.id[idx] if results[0].boxes.id is not None else 'NEW'}] 距离: {dist:.1f}m", end="", flush=True)
+            else:
+                # 失去目标逻辑
+                if time.time() - cmd_state["last_update"] > 0.5:
+                    cmd_state["active"] = False
+                    print(f"\r\033[K😌 安全监视中...", end="", flush=True)
+
+            if cmd_state["active"]:
+                cmd_state["vx"], cmd_state["vyaw"], cmd_state["pitch"] = v_x, v_yaw, p_pitch
+
+    except KeyboardInterrupt:
+        print("\n🛑 安全退出...")
+
+if __name__ == "__main__":
+    main()

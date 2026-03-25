@@ -1,0 +1,16 @@
+{
+  "ws_url": "ws://127.0.0.1:8080/ws",
+  "user_id": "python_client_001",
+  "token": "R5NXpdgOFyAjyclSR6206NqB7z1DOFZr",
+  "agent_id": "",
+  "tone_id": "",
+  "scene_type": "default",
+  "subtitle": true,
+  "business_id": 4,
+  "sample_rate": 16000,
+  "channels": 1,
+  "bits_per_sample": 16,
+  "frame_duration_ms": 20,
+  "ping_interval_sec": 1.0,
+  "log_level": "INFO"
+}

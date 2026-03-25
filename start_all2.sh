@@ -30,9 +30,11 @@ tmux select-layout -t "$SESSION:0" tiled
 # pane 对应关系：
 # 0.0 tunnel, 0.1 robot, 0.2 ros2, 0.3 yolo
 # 转发 server 检测端口(5802)ssh -N -L 5802:127.0.0.1:5802 -L 8080:127.0.0.1:8080；Web UI(8080) 在 Client 本地运行，无需转发
-run_in_target "$SESSION:0.0" "sshpass -p 40er920h ssh -N -L 5802:127.0.0.1:5802 -p 30077 root@183.147.142.40"
+run_in_target "$SESSION:0.0" "sshpass -p t0pxxqky ssh -N -L 5802:127.0.0.1:5802 -p 30438 root@183.147.142.40"
 run_in_target "$SESSION:0.1" "cd ~/InternNav-deploy/onboard/ && ./start_robot.sh"
-run_in_target "$SESSION:0.2" "source ~/ros2_ws/install/setup.bash ;ros2 launch go2_core go2_startup_XT16.launch.py"
+# run_in_target "$SESSION:0.2" "ros2 launch go2_core go2_startup_XT16.launch.py"
+run_in_target "$SESSION:0.2" "source ~/ros2_ws/install/setup.bash ;ros2 launch go2_core go2_startup_MID360.launch.py"
+
 
 YOLO_CMD="python3 -u yolo_detect_client.py \
     --server-url http://127.0.0.1:5802/detect \
@@ -41,10 +43,16 @@ YOLO_CMD="python3 -u yolo_detect_client.py \
     --depth-topic /camera/camera/aligned_depth_to_color/image_raw \
     --odom-topic /odom_bridge \
     --frame-stride 10 \
-    --goal-standoff 0.0 \
+    --goal-standoff 0.3 \
     --map-frame map \
     --base-link-frame base_link \
-    --webui-port 8083"
+    --webui-port 8083 \
+    --goal-send-mode goal_pose \
+    --arrival-threshold 0.4 \
+    --nav-log ~/RealVLN/Go2RealtimeAPI/master/RealtimeAPI-sdk-python/nav_logs/navigation.jsonl \
+    --go2-interface eth0 \
+    --deepseek-api-key sk-b1b8fd45c23a41c3b09f90161f874999"
+
 run_in_target "$SESSION:0.3" "cd ~/RealVLN/ && $YOLO_CMD"
 
 # enter session

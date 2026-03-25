@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Go2 Auto Walk - 自主遛狗模式
+
+功能：
+1. 持续拍照分析前方路况
+2. 使用VLM识别可行走区域和障碍物
+3. 根据路况自动决策（直行、转弯、避障）
+4. 动态调整行走速度
+5. 检测危险区域自动停止
+
+工作流程：
+- 前方通畅 → 直行加速
+- 前方有障碍 → 减速绕行
+- 遇到路口 → 扫描侧方选择最佳路径
+- 危险区域 → 立即停止
+"""
+
+import sys
+import os
+import time
+import json
+import subprocess
+import argparse
+from datetime import datetime
+
+# 媒体保存路径
+MEDIA_DIR = os.path.expanduser("~/.openclaw/media")
+CAPTURE_PATH = os.path.join(MEDIA_DIR, "go2_camera.jpg")
+
+# ========== 可配置参数 ==========
+# 安全参数
+SAFE_DISTANCE = 1.0      # 安全距离（米）
+MIN_CLEARANCE = 0.5      # 最小通行宽度（米）
+DANGER_DISTANCE = 0.3    # 危险距离（米）
+
+# 速度参数 (m/s)
+MAX_SPEED = 0.5          # 最大速度
+MEDIUM_SPEED = 0.3       # 中速
+SLOW_SPEED = 0.15        # 慢速
+MIN_SPEED = 0.08         # 最小速度
+
+# 时间参数
+DECISION_INTERVAL = 2.0  # 决策间隔（秒）
+CAPTURE_TIMEOUT = 10     # 拍照超时（秒）
+ANALYSIS_TIMEOUT = 30    # VLM分析超时（秒）
+MOVE_DURATION = 2.0      # 单次移动持续时间（秒）
+
+# 扫描参数
+SCAN_ANGLE = 30          # 扫描转弯角度（度）
+SCAN_WAIT_TIME = 1.0     # 扫描后等待稳定时间（秒）
+
+# 连续转向限制
+MAX_CONSECUTIVE_TURNS = 3  # 最大连续转向次数，防止原地打转
+consecutive_turns = 0      # 当前连续转向计数
+
+
+def log(message):
+    """打印带时间戳的日志"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+
+def capture_image():
+    """拍照并返回图片路径"""
+    try:
+        result = subprocess.run(
+            ['python3', '/home/unitree/openclaw/skills/go2-vision/scripts/capture.py'],
+            capture_output=True,
+            text=True,
+            timeout=CAPTURE_TIMEOUT
+        )
+        if result.returncode == 0:
+            return CAPTURE_PATH
+        log(f"❌ 拍照失败: {result.stderr}")
+        return None
+    except Exception as e:
+        log(f"❌ 拍照异常: {e}")
+        return None
+
+
+def analyze_road_condition(image_path):
+    """
+    使用VLM分析前方路况
+    
+    返回: {
+        'walkable': bool,      # 是否可行走
+        'score': int,          # 路况评分 1-5 (5=畅通, 1=危险)
+        'obstacles': list,     # 检测到的障碍物
+        'danger': bool,        # 是否有危险区域
+        'recommended_action': str,  # 建议动作
+        'clearance_left': float,    # 左侧通行空间 (米)
+        'clearance_right': float,   # 右侧通行空间 (米)
+        'clearance_center': float,  # 中间通行空间 (米)
+    }
+    """
+    try:
+        # VLM 提示词
+        prompt = """分析这张机器狗前方视角的照片，评估路况：
+
+请按以下JSON格式返回分析结果：
+{
+  "walkable": true/false,      // 前方是否有可行走的平地
+  "score": 1-5,                // 路况评分：5=开阔畅通，4=良好可通行，3=一般需谨慎，2=拥挤难通行，1=危险不可走
+  "obstacles": ["障碍物1", "障碍物2"],  // 检测到的障碍物列表（如：椅子、桌子、人、墙壁、门槛等）
+  "danger": true/false,        // 是否有危险区域（楼梯、悬崖、大台阶、深坑等）
+  "recommended_action": "动作", // 建议动作：go_forward / turn_left / turn_right / stop / back
+  "clearance_left": 数值,      // 估计左侧可通行宽度（米），不知道填0.5
+  "clearance_right": 数值,     // 估计右侧可通行宽度（米），不知道填0.5
+  "clearance_center": 数值,    // 估计正前方可通行宽度（米），不知道填1.0
+  "reason": "判断理由"         // 简短说明为什么给出这个建议
+}
+
+注意：
+1. 机器狗高度约40cm，能通过的空间需要至少50cm宽
+2. 楼梯、大台阶对机器狗是危险的
+3. 地板、平地、短毛地毯是可行走的
+4. 距离判断：画面底部是近处，顶部是远处"""
+
+        # 尝试调用 image 工具分析（OpenClaw 环境）
+        try:
+            # 尝试使用 OpenClaw 的 image 工具
+            import requests
+            import base64
+            
+            # 读取图片并转为 base64
+            with open(image_path, 'rb') as f:
+                image_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            # 调用本地 OpenClaw API（如果在环境中）
+            # 或者使用简单模拟
+            response_text = _call_vlm_with_image(image_path, prompt)
+            
+        except Exception as api_error:
+            log(f"⚠️ VLM API调用失败，使用模拟分析: {api_error}")
+            # 模拟分析结果（测试用）
+            response_text = _simulate_road_analysis(image_path)
+        
+        # 尝试提取 JSON
+        import re
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        if json_match:
+            json_str = json_match.group()
+            analysis = json.loads(json_str)
+        else:
+            # 如果无法提取JSON，解析文本内容
+            analysis = _parse_text_analysis(response_text)
+        
+        return analysis
+        
+    except Exception as e:
+        log(f"❌ 路况分析异常: {e}")
+        # 返回保守的默认结果
+        return _get_default_analysis(str(e))
+
+
+def _call_vlm_with_image(image_path, prompt):
+    """调用VLM分析图片（尝试多种方式）"""
+    
+    # 方式1: 尝试使用 OpenClaw 环境变量中的 API
+    openclaw_api = os.environ.get('OPENCLAW_API_URL', 'http://localhost:8080')
+    
+    try:
+        import requests
+        import base64
+        
+        with open(image_path, 'rb') as f:
+            image_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # 尝试调用 OpenClaw 的 image 分析端点
+        response = requests.post(
+            f"{openclaw_api}/api/v1/analyze",
+            json={
+                "image": image_base64,
+                "prompt": prompt
+            },
+            timeout=ANALYSIS_TIMEOUT
+        )
+        
+        if response.status_code == 200:
+            return response.json().get('response', '')
+    except:
+        pass
+    
+    # 方式2: 使用简单的文件读取 + 外部调用
+    # 这里可以接入其他 VLM API，如 DashScope、OpenAI 等
+    
+    # 默认返回空，触发模拟模式
+    return ""
+
+
+def _simulate_road_analysis(image_path):
+    """模拟路况分析（测试用）"""
+    # 实际使用时应该删除这个函数，改为真实VLM调用
+    import random
+    
+    # 随机生成一个路况（测试用）
+    scenarios = [
+        {
+            "walkable": True,
+            "score": 5,
+            "obstacles": [],
+            "danger": False,
+            "recommended_action": "go_forward",
+            "clearance_left": 1.5,
+            "clearance_right": 1.5,
+            "clearance_center": 2.0,
+            "reason": "前方开阔，地板平整，无障碍物，可全速前进"
+        },
+        {
+            "walkable": True,
+            "score": 4,
+            "obstacles": ["椅子"],
+            "danger": False,
+            "recommended_action": "go_forward",
+            "clearance_left": 1.0,
+            "clearance_right": 0.8,
+            "clearance_center": 1.2,
+            "reason": "前方有可通行空间，左侧空间较大，右侧有椅子，建议保持中速"
+        },
+        {
+            "walkable": True,
+            "score": 3,
+            "obstacles": ["桌子", "椅子"],
+            "danger": False,
+            "recommended_action": "go_forward",
+            "clearance_left": 0.6,
+            "clearance_right": 0.6,
+            "clearance_center": 0.8,
+            "reason": "前方通道较窄，两侧有桌椅，需要谨慎慢行"
+        },
+        {
+            "walkable": True,
+            "score": 2,
+            "obstacles": ["柜子", "墙壁"],
+            "danger": False,
+            "recommended_action": "turn_left",
+            "clearance_left": 0.4,
+            "clearance_right": 0.3,
+            "clearance_center": 0.5,
+            "reason": "前方空间拥挤，左右两侧通行空间有限，建议转向探索其他方向"
+        },
+        {
+            "walkable": False,
+            "score": 1,
+            "obstacles": ["楼梯"],
+            "danger": True,
+            "recommended_action": "stop",
+            "clearance_left": 0.3,
+            "clearance_right": 0.3,
+            "clearance_center": 0.0,
+            "reason": "⚠️ 前方检测到楼梯！这是危险区域，立即停止，后退"
+        }
+    ]
+    
+    scenario = random.choice(scenarios)
+    return json.dumps(scenario, ensure_ascii=False)
+
+
+def _parse_text_analysis(text):
+    """从文本中解析分析结果（当JSON提取失败时使用）"""
+    text_lower = text.lower()
+    
+    analysis = {
+        'walkable': 'danger' not in text_lower and '楼梯' not in text,
+        'score': 3,
+        'obstacles': [],
+        'danger': 'danger' in text_lower or '危险' in text or '楼梯' in text,
+        'recommended_action': 'go_forward',
+        'clearance_left': 0.5,
+        'clearance_right': 0.5,
+        'clearance_center': 1.0,
+        'reason': text[:100] if text else '文本解析结果'
+    }
+    
+    # 根据文本内容调整
+    if 'stop' in text_lower or '停止' in text:
+        analysis['recommended_action'] = 'stop'
+        analysis['score'] = 1
+    elif 'turn_left' in text_lower or '左转' in text:
+        analysis['recommended_action'] = 'turn_left'
+        analysis['score'] = 2
+    elif 'turn_right' in text_lower or '右转' in text:
+        analysis['recommended_action'] = 'turn_right'
+        analysis['score'] = 2
+    
+    return analysis
+
+
+def _get_default_analysis(error_msg=""):
+    """返回默认保守分析结果"""
+    return {
+        'walkable': True,
+        'score': 3,
+        'obstacles': [],
+        'danger': False,
+        'recommended_action': 'go_forward',
+        'clearance_left': 0.5,
+        'clearance_right': 0.5,
+        'clearance_center': 1.0,
+        'reason': f'使用默认保守策略: {error_msg[:30]}'
+    }
+
+
+def control_robot(action, angle=None, duration=None, speed=None):
+    """
+    控制机器狗移动
+    
+    action: 动作名称
+    angle: 转向角度（用于turn_left/turn_right）
+    duration: 移动持续时间（秒）
+    speed: 移动速度（m/s）
+    """
+    try:
+        cmd = ['python3', '/home/unitree/openclaw/skills/unitree-go2/scripts/go2_control.py', action]
+        if angle:
+            cmd.extend(['--angle', str(angle)])
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        success = result.returncode == 0
+        if not success:
+            log(f"⚠️ 控制命令失败: {result.stderr[:100]}")
+        return success
+    except Exception as e:
+        log(f"❌ 控制异常: {e}")
+        return False
+
+
+def scan_direction(direction, angle=SCAN_ANGLE):
+    """
+    扫描指定方向的路况
+    
+    direction: 'left' 或 'right'
+    返回: 路况分析结果
+    """
+    global consecutive_turns
+    
+    log(f"🔍 扫描{ '左侧' if direction == 'left' else '右侧' }路况...")
+    
+    # 转向指定方向
+    if direction == 'left':
+        control_robot('turn_left', angle=angle)
+    else:
+        control_robot('turn_right', angle=angle)
+    
+    # 等待稳定
+    time.sleep(SCAN_WAIT_TIME)
+    
+    # 拍照分析
+    image_path = capture_image()
+    if not image_path:
+        return None
+    
+    analysis = analyze_road_condition(image_path)
+    
+    # 转回原位
+    if direction == 'left':
+        control_robot('turn_right', angle=angle)
+    else:
+        control_robot('turn_left', angle=angle)
+    
+    time.sleep(0.5)
+    
+    if analysis:
+        log(f"  {'左侧' if direction == 'left' else '右侧'}评分: {analysis['score']}/5, "
+            f"建议: {analysis['recommended_action']}")
+    
+    return analysis
+
+
+def decide_best_direction(current_analysis):
+    """
+    决策最佳前进方向
+    
+    返回: (action, angle, speed, reason)
+    """
+    global consecutive_turns
+    
+    score = current_analysis.get('score', 3)
+    danger = current_analysis.get('danger', False)
+    action = current_analysis.get('recommended_action', 'go_forward')
+    
+    # 有危险，立即停止
+    if danger:
+        consecutive_turns = 0
+        return ('stop', 0, 0, f"检测到危险！{current_analysis.get('reason', '')}")
+    
+    # 路况良好，直行
+    if score >= 4:
+        consecutive_turns = 0
+        speed = MAX_SPEED if score == 5 else MEDIUM_SPEED
+        return ('move_forward', 0, speed, f"路况评分{score}/5，直行")
+    
+    # 路况一般，慢速直行
+    if score == 3:
+        consecutive_turns = 0
+        return ('move_forward', 0, SLOW_SPEED, f"路况评分{score}/5，谨慎前行")
+    
+    # 路况较差，需要探索其他方向
+    if score <= 2:
+        # 防止原地打转
+        if consecutive_turns >= MAX_CONSECUTIVE_TURNS:
+            consecutive_turns = 0
+            log("⚠️ 连续转向过多，尝试后退重新规划")
+            return ('move_backward', 0, MIN_SPEED, "避免原地打转，后退重新规划")
+        
+        # 扫描左侧
+        left_analysis = scan_direction('left')
+        # 扫描右侧  
+        right_analysis = scan_direction('right')
+        
+        left_score = left_analysis.get('score', 0) if left_analysis else 0
+        right_score = right_analysis.get('score', 0) if right_analysis else 0
+        
+        # 选择评分更高的方向
+        if left_score > score or right_score > score:
+            if left_score >= right_score and left_score > 0:
+                consecutive_turns += 1
+                return ('turn_left', SCAN_ANGLE, MIN_SPEED, f"左侧评分{left_score} > 前方{score}，左转")
+            else:
+                consecutive_turns += 1
+                return ('turn_right', SCAN_ANGLE, MIN_SPEED, f"右侧评分{right_score} > 前方{score}，右转")
+        else:
+            # 所有方向都不好，尝试慢速前进或后退
+            if score == 2:
+                consecutive_turns = 0
+                return ('move_forward', 0, MIN_SPEED, f"各方向均不佳，极慢速尝试前行")
+            else:
+                consecutive_turns = 0
+                return ('stop', 0, 0, f"前方危险，停止等待")
+    
+    # 默认策略
+    consecutive_turns = 0
+    return ('move_forward', 0, SLOW_SPEED, "默认策略：谨慎前行")
+
+
+def execute_movement(action, angle, speed, duration=MOVE_DURATION):
+    """
+    执行移动动作
+    
+    返回: 是否成功
+    """
+    if action == 'stop':
+        log("🛑 停止")
+        return control_robot('stop')
+    
+    elif action == 'move_forward':
+        log(f"⬆️  前进 (速度{speed:.2f}m/s, {duration}秒)")
+        # 使用持续移动
+        try:
+            cmd = ['python3', '/home/unitree/openclaw/skills/unitree-go2/scripts/go2_control.py', 'move_forward']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 5)
+            return result.returncode == 0
+        except Exception as e:
+            log(f"⚠️ 前进异常: {e}")
+            return False
+    
+    elif action == 'move_backward':
+        log(f"⬇️  后退 (速度{MIN_SPEED:.2f}m/s)")
+        return control_robot('move_backward')
+    
+    elif action == 'turn_left':
+        log(f"⬅️  左转 {angle}度")
+        return control_robot('turn_left', angle=angle)
+    
+    elif action == 'turn_right':
+        log(f"➡️  右转 {angle}度")
+        return control_robot('turn_right', angle=angle)
+    
+    return False
+
+
+def auto_walk(duration_seconds=0, network_interface='eth0'):
+    """
+    自主行走主循环
+    
+    duration_seconds: 行走持续时间，0表示无限
+    """
+    global consecutive_turns
+    
+    log("=" * 60)
+    log("🐕 启动自主遛狗模式 (Auto Walk)")
+    log("=" * 60)
+    log("工作原理:")
+    log("  📷 拍照 → 🔍 VLM分析路况 → 🧠 决策 → 🏃 执行 → 🔄 循环")
+    log("")
+    log("速度等级:")
+    log(f"  🚀 快速: {MAX_SPEED} m/s (路况评分5)")
+    log(f"  ⚡ 中速: {MEDIUM_SPEED} m/s (路况评分4)")
+    log(f"  🐢 慢速: {SLOW_SPEED} m/s (路况评分3)")
+    log(f"  🐌 极慢: {MIN_SPEED} m/s (路况评分2)")
+    log("")
+    log("安全机制:")
+    log("  ⚠️  检测到危险区域自动停止")
+    log("  🔄 连续转向超过3次会后退重新规划")
+    log("  🛑 按 Ctrl+C 立即停止")
+    log("=" * 60)
+    log("")
+    
+    # 确保站立
+    log("🦮 准备出发...")
+    control_robot('stand_up')
+    time.sleep(1)
+    
+    start_time = time.time()
+    iteration = 0
+    consecutive_turns = 0
+    
+    try:
+        while True:
+            iteration += 1
+            elapsed = time.time() - start_time
+            
+            # 检查是否超时
+            if duration_seconds > 0 and elapsed >= duration_seconds:
+                log(f"⏰ 达到设定时间 {duration_seconds}秒，停止行走")
+                break
+            
+            log(f"\n--- 第{iteration}轮决策 (已行走{elapsed:.1f}秒) ---")
+            
+            # 1. 拍照
+            log("📷 拍照分析路况...")
+            image_path = capture_image()
+            if not image_path:
+                log("❌ 拍照失败，等待后重试")
+                time.sleep(DECISION_INTERVAL)
+                continue
+            
+            # 2. 分析路况
+            log("🧠 VLM分析中...")
+            analysis = analyze_road_condition(image_path)
+            
+            score = analysis.get('score', 0)
+            obstacles = analysis.get('obstacles', [])
+            danger = analysis.get('danger', False)
+            reason = analysis.get('reason', '')
+            
+            log(f"📊 路况评分: {score}/5")
+            if obstacles:
+                log(f"🚧 检测到障碍物: {', '.join(obstacles)}")
+            if danger:
+                log(f"⚠️  检测到危险区域！")
+            log(f"💡 分析理由: {reason[:80]}...")
+            
+            # 3. 决策
+            action, angle, speed, decision_reason = decide_best_direction(analysis)
+            log(f"🎯 决策: {decision_reason}")
+            
+            # 4. 执行动作
+            execute_movement(action, angle, speed)
+            
+            # 5. 等待下一次决策
+            log(f"⏳ 等待{DECISION_INTERVAL}秒后进行下一轮...")
+            time.sleep(DECISION_INTERVAL)
+            
+    except KeyboardInterrupt:
+        log("\n🛑 收到停止指令")
+    except Exception as e:
+        log(f"\n❌ 发生异常: {e}")
+    
+    # 清理
+    log("🧹 清理...")
+    control_robot('stop')
+    time.sleep(0.5)
+    log("✅ 自主行走模式已停止")
+
+
+def test_mode():
+    """测试模式：只分析路况，不移动"""
+    log("=" * 60)
+    log("🧪 测试模式 - 只分析路况，不移动")
+    log("=" * 60)
+    
+    log("📷 拍照...")
+    image_path = capture_image()
+    if not image_path:
+        log("❌ 拍照失败")
+        return
+    
+    log("🧠 分析路况...")
+    analysis = analyze_road_condition(image_path)
+    
+    log("\n📊 分析结果:")
+    log(f"  可行走: {'✅' if analysis.get('walkable') else '❌'}")
+    log(f"  路况评分: {analysis.get('score', 0)}/5")
+    log(f"  障碍物: {', '.join(analysis.get('obstacles', []))}")
+    log(f"  危险区域: {'⚠️ 有' if analysis.get('danger') else '✅ 无'}")
+    log(f"  建议动作: {analysis.get('recommended_action', 'unknown')}")
+    log(f"  左侧空间: {analysis.get('clearance_left', 0)}米")
+    log(f"  右侧空间: {analysis.get('clearance_right', 0)}米")
+    log(f"  中间空间: {analysis.get('clearance_center', 0)}米")
+    log(f"  理由: {analysis.get('reason', 'N/A')}")
+    
+    # 显示决策
+    action, angle, speed, reason = decide_best_direction(analysis)
+    log(f"\n🎯 系统决策: {action}")
+    log(f"   角度: {angle}度, 速度: {speed}m/s")
+    log(f"   理由: {reason}")
+
+
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(
+        description='Go2 自主遛狗模式 - 自动发现路径、避障、导航',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python3 auto_walk.py                    # 持续自主行走
+  python3 auto_walk.py -d 60              # 行走60秒后停止
+  python3 auto_walk.py -t                 # 测试模式（只分析不移动）
+  python3 auto_walk.py -n eth0            # 指定网络接口
+        """
+    )
+    
+    parser.add_argument('--duration', '-d', type=int, default=0,
+                        help='行走持续时间（秒），0表示无限（默认：0）')
+    parser.add_argument('--test', '-t', action='store_true',
+                        help='测试模式：只拍照分析路况，不移动')
+    parser.add_argument('--network', '-n', type=str, default='eth0',
+                        help='网络接口名称（默认：eth0）')
+    
+    args = parser.parse_args()
+    
+    if args.test:
+        test_mode()
+    else:
+        auto_walk(duration_seconds=args.duration)
+
+
+if __name__ == '__main__':
+    main()

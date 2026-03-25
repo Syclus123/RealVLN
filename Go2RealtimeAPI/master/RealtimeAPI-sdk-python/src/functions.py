@@ -328,4 +328,4 @@ GO2_TOOLS = [
     },
 ]
 
-# GO2_TOOLS.extend(ACTION_TOOLS)
+GO2_TOOLS.extend(ACTION_TOOLS)

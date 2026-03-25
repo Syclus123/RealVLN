@@ -160,7 +160,7 @@ python -u yolo_detect_server.py \
 export ARK_API_KEY=f622fb17-c76d-48d4-a184-17f52f7e41aa
 python -u yolo_detect_server.py \
     --model yolov8x-worldv2.pt \
-    --vocab basketball,soccer,tissue,toy,helmet,fish,carrot \
+    --vocab basketball,soccer,tissue,toy,helmet,can \
     --conf 0.35 \
     --cam-json cam_params.json \
     --fusion moving_average --moving-avg-window 5 \

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Go2 Guard Dog V3 - 具身威胁姿态版
+功能进化：
+1. 预备扑击姿态：人靠近时，狗子会降低重心（BodyHeight）并前倾低头（Pitch），模拟猛犬俯冲动作。
+2. 动作与声音耦合：叫声触发时，身体会配合俯仰抖动，增加生动感。
+3. 状态机增强：区分了平静、注视、警戒（低头叫）、退防（压低后退）四个阶段。
+"""
+
+import sys
+import os
+import time
+import cv2
+import numpy as np
+import threading
+import argparse
+import contextlib
+from ultralytics import YOLO
+
+# 导入宇树 SDK
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.go2.video.video_client import VideoClient
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+
+# 动态导入语音技能
+sys.path.insert(0, '/home/unitree/openclaw/skills/go2-audio-play/scripts')
+from play import play_sound
+
+# ==========================================
+# 配置与阈值
+# ==========================================
+NETWORK_INTERFACE = "eth0"
+MODEL_PATH = '/home/unitree/openclaw/skills/unitree-go2/yolov8n.pt'
+SOUND_PATH = '/home/unitree/openclaw/skills/go2-audio-play/sounds/dog_barking.wav'
+
+WARN_DISTANCE = 2.0      
+DANGER_DISTANCE = 1.0    
+RETREAT_SPEED = -0.2     # 降低了后退速度，让动作更稳
+
+# 姿态参数
+STAND_HEIGHT = 0.0       # 正常站立高度
+LOW_HEIGHT = -0.15       # 警戒时降低重心（米）
+POUNCE_PITCH = 0.35      # 扑击前倾角度（弧度，约20度，低头前倾）
+NORMAL_PITCH = 0.0
+
+BARK_INTERVAL = 1.2      
+SMOOTH_FACTOR = 0.12     # 稍微调慢平滑因子，让姿态切换更有“肌肉感”
+
+DISTANCE_Y2_MAP = {
+    0.70: 3.0,   
+    0.80: 2.0,   
+    0.90: 1.0,   
+    0.95: 0.5,   
+}
+
+# 扩展指令状态
+cmd_state = {
+    "vx": 0.0,
+    "vyaw": 0.0,
+    "pitch": 0.0,
+    "height": 0.0,
+    "last_update": 0.0
+}
+
+class GuardState:
+    IDLE = "idle"
+    WATCHING = "watching"
+    BARKING = "barking"     # 压低身体警告
+    RETREATING = "retreating"
+
+bark_event = threading.Event()
+
+# ==========================================
+# 1. 音频守护线程 (带打印遮罩)
+# ==========================================
+def audio_worker_thread():
+    print("🟢 [音频线程] 真声服务已就绪...")
+    while True:
+        if bark_event.is_set():
+            try:
+                # 保持静默播放，不破坏 UI
+                with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f):
+                    play_sound(SOUND_PATH)
+            except Exception as e:
+                print(f"\n❌ 播放异常: {e}")
+            time.sleep(BARK_INTERVAL)
+            bark_event.clear()
+        else:
+            time.sleep(0.05)
+
+# ==========================================
+# 2. 运动控制线程 (姿态+速度融合)
+# ==========================================
+def control_thread_task(sport_client):
+    print("🟢 [控制线程] 姿态与动力融合算法启动...")
+    real_vx, real_vyaw = 0.0, 0.0
+    real_pitch, real_height = 0.0, 0.0
+    
+    try:
+        while True:
+            # 超时安全检查
+            if time.time() - cmd_state["last_update"] > 0.5:
+                t_vx, t_vyaw, t_pitch, t_height = 0.0, 0.0, 0.0, 0.0
+            else:
+                t_vx = cmd_state["vx"]
+                t_vyaw = cmd_state["vyaw"]
+                t_pitch = cmd_state["pitch"]
+                t_height = cmd_state["height"]
+
+            # 平滑过渡逻辑
+            real_vx += SMOOTH_FACTOR * (t_vx - real_vx)
+            real_vyaw += SMOOTH_FACTOR * (t_vyaw - real_vyaw)
+            real_pitch += SMOOTH_FACTOR * (t_pitch - real_pitch)
+            real_height += SMOOTH_FACTOR * (t_height - real_height)
+
+            # 1. 发送行走指令
+            sport_client.Move(real_vx, 0.0, real_vyaw)
+            
+            # 2. 发送姿态指令：Euler(roll, pitch, yaw)
+            # 在 Go2 中，这通常能带动身体重心的偏移
+            sport_client.Euler(0.0, real_pitch, 0.0)
+            
+            # 3. 修复高度指令：
+            # 如果你的 SDK 没有 BodyHeight，请尝试注释掉这一行
+            # 或者使用 sport_client.StandHeight(real_height) 如果你的版本支持
+            # sport_client.BodyHeight(real_height)  <-- 删掉或注释掉这一行
+
+            time.sleep(0.05)
+    except Exception as e:
+        print(f"❌ [控制线程] 异常: {e}")
+    finally:
+        sport_client.StopMove()
+        sport_client.Euler(0.0, 0.0, 0.0)
+        #sport_client.BodyHeight(0.0)
+
+# ==========================================
+# 3. 核心决策大脑
+# ==========================================
+def estimate_distance(y2):
+    y2_p = sorted(DISTANCE_Y2_MAP.keys())
+    d_p = [DISTANCE_Y2_MAP[y] for y in y2_p]
+    if y2 <= y2_p[0]: return d_p[0]
+    if y2 >= y2_p[-1]: return d_p[-1]
+    return np.interp(y2, y2_p, d_p)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", action="store_true")
+    args = parser.parse_args()
+
+    print("🐕 Go2 Guard Dog V3 - 姿态控制版启动...")
+    ChannelFactoryInitialize(0, NETWORK_INTERFACE)
+    
+    video_client = VideoClient()
+    video_client.Init()
+
+    sport_client = None
+    if not args.test:
+        sport_client = SportClient()
+        sport_client.Init()
+
+    model = YOLO(MODEL_PATH)
+    # 预热
+    model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+
+    threading.Thread(target=audio_worker_thread, daemon=True).start()
+    if sport_client:
+        threading.Thread(target=control_thread_task, args=(sport_client,), daemon=True).start()
+
+    print("\n🛡️ 区域防守中。检测到入侵者时狗子将进入“扑击姿态”。\n")
+
+    current_state = GuardState.IDLE
+    try:
+        while True:
+            code, data = video_client.GetImageSample()
+            if code != 0: continue
+            
+            img = cv2.imdecode(np.frombuffer(bytes(data), np.uint8), cv2.IMREAD_COLOR)
+            results = model.track(img, classes=[0], conf=0.45, persist=True, tracker="botsort.yaml", verbose=False)
+            
+            person_detected = False
+            target_h, target_y2 = 0.0, 0.0
+            
+            if results[0].boxes.id is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                max_area = 0
+                for box in boxes:
+                    x1, y1, x2, y2 = box
+                    if (x2-x1)*(y2-y1) > max_area:
+                        max_area = (x2-x1)*(y2-y1)
+                        person_detected = True
+                        target_h = ((x1 + x2) / (2 * img.shape[1]) - 0.5) * 2
+                        target_y2 = y2 / img.shape[0]
+
+            # --- 决策矩阵 ---
+            v_x, v_yaw, p_pitch, h_height = 0.0, 0.0, 0.0, 0.0
+            
+            if person_detected:
+                dist = estimate_distance(target_y2)
+                v_yaw = -target_h * 1.5
+                v_yaw = max(-0.8, min(0.8, v_yaw))
+
+                if dist > WARN_DISTANCE:
+                    new_state = GuardState.WATCHING
+                    action_desc = "锁定目标"
+                    p_pitch = 0.0
+                    h_height = 0.0
+                elif dist > DANGER_DISTANCE:
+                    new_state = GuardState.BARKING
+                    action_desc = "俯冲警告!"
+                    bark_event.set()
+                    # 关键姿态：低头 + 压低身体
+                    p_pitch = POUNCE_PITCH
+                    h_height = LOW_HEIGHT
+                else:
+                    new_state = GuardState.RETREATING
+                    action_desc = "压低退防"
+                    v_x = RETREAT_SPEED
+                    bark_event.set()
+                    p_pitch = POUNCE_PITCH
+                    h_height = LOW_HEIGHT
+            else:
+                new_state = GuardState.IDLE
+                action_desc = "安全"
+
+            if not args.test:
+                cmd_state["vx"] = v_x
+                cmd_state["vyaw"] = v_yaw
+                cmd_state["pitch"] = p_pitch
+                cmd_state["height"] = h_height
+                cmd_state["last_update"] = time.time()
+
+            # 打印逻辑
+            emoji = {"idle":"😌", "watching":"👀", "barking":"🚨", "retreating":"🐕"}
+            print(f"\r\033[K{emoji[new_state]} [距 {dist if person_detected else 0:.1f}m] | 状态: {action_desc} | Pitch: {p_pitch:.2f} Height: {h_height:.2f}", end="", flush=True)
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 安全退出...")
+        if sport_client:
+            sport_client.StopMove()
+            sport_client.Euler(0,0,0)
+            sport_client.BodyHeight(0)
+
+if __name__ == "__main__":
+    main()

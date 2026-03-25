@@ -1,0 +1,55 @@
+import sounddevice as sd
+import numpy as np
+from scipy import signal
+
+# ==========================================
+# 步骤 1：设置你的 Jabra 设备 ID
+# ==========================================
+# 请替换为你之前用 python3 -m sounddevice 查到的 ID
+INPUT_DEVICE = 24   
+OUTPUT_DEVICE = 24  
+
+sd.default.device = (INPUT_DEVICE, OUTPUT_DEVICE)
+
+# ==========================================
+# 步骤 2：定义输入和输出的真实物理参数
+# ==========================================
+record_fs = 16000     # 麦克风硬件真实采样率
+play_fs = 48000       # 扬声器硬件真实采样率
+duration = 3          # 录音时长
+channels = 1          # 单声道
+
+if __name__ == "__main__":
+    print(f"\n[录音中] 请对着麦克风说话，持续 {duration} 秒...")
+    
+    # ⚠️ 关键修改 1：dtype 必须改为 'int16'，这是 USB 声卡的通用语言
+    myrecording = sd.rec(int(duration * record_fs), 
+                         samplerate=record_fs, 
+                         channels=channels, 
+                         dtype='int16')
+    sd.wait()
+    print("[录音完毕]")
+
+    # ==========================================
+    # 步骤 3：在内存中重采样 (16k -> 48k)
+    # ==========================================
+    print("正在进行重采样和信号处理...")
+    
+    # 计算目标数组的长度: 原始长度 * (目标频率 / 原始频率)
+    target_length = int(len(myrecording) * (play_fs / record_fs))
+    
+    # 使用 scipy 将录音拉伸到 48000 的长度
+    resampled_audio = signal.resample(myrecording, target_length)
+    
+    # ⚠️ 关键修改 2：scipy 计算后会把数组变成 float，必须强转回 int16，否则播放又是杂音
+    resampled_audio = np.int16(resampled_audio)
+
+    # ==========================================
+    # 步骤 4：播放处理后的音频
+    # ==========================================
+    print("\n[播放中] 正在回放...")
+    
+    # 用 48000 Hz 的频率，播放已经被拉伸过的数组
+    sd.play(resampled_audio, samplerate=play_fs)
+    sd.wait()
+    print("[播放完毕]")

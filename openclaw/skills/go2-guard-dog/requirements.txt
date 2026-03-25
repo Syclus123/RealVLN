@@ -1,0 +1,18 @@
+# Go2 Guard Dog 依赖
+# 安装: pip install -r requirements.txt
+
+# 宇树 SDK
+unitree_sdk2py
+
+# 目标检测
+ultralytics>=8.0.0
+
+# 图像处理
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# 音频播放
+sounddevice>=0.4.6
+
+# 其他
+pyyaml>=6.0

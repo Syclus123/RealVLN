@@ -38,6 +38,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 清理旧日志和导航记录
+info "清理旧日志文件..."
+> nav_logs/navigation.jsonl
+rm -f audio_client.log
+rm -f audio_server.log
+rm -f nohup.out.fast_client
+rm -f main_client.log
+rm -f nohup.out.local_server
+info "旧日志清理完成"
+
 check_uv
 info "同步项目依赖..."
 uv sync

@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Go2 Guard Dog V2 - 满血看家狗系统 (接入真实扬声器版)
+"""
+
+import sys
+import os
+import time
+import cv2
+import numpy as np
+import threading
+import argparse
+import contextlib
+from ultralytics import YOLO
+
+# 导入宇树 SDK
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.go2.video.video_client import VideoClient
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+
+# ==========================================
+# 动态导入你的 go2-audio-play 技能
+# ==========================================
+sys.path.insert(0, '/home/unitree/openclaw/skills/go2-audio-play/scripts')
+from play import play_sound
+
+# ==========================================
+# 配置与阈值
+# ==========================================
+NETWORK_INTERFACE = "eth0"
+MODEL_PATH = '/home/unitree/openclaw/skills/unitree-go2/yolov8n.pt'
+SOUND_PATH = '/home/unitree/openclaw/skills/go2-audio-play/sounds/dog_barking.wav'
+
+WARN_DISTANCE = 2.0      
+DANGER_DISTANCE = 1.0    
+RETREAT_SPEED = 0.0     
+BARK_INTERVAL = 1.0      # 叫声冷却时间 (等待上次叫完后，间隔 1 秒再叫)
+CMD_TIMEOUT = 0.5        
+SMOOTH_FACTOR = 0.15     
+
+# 行为参数增加
+NORMAL_HEIGHT = 0.0     # 正常高度（0为默认）
+LOW_HEIGHT = -0.1       # 降低重心（压低身体）
+POUNCE_PITCH = 0.25     # 前倾角度（弧度制，约15度，正值通常为低头前倾）
+
+
+DISTANCE_Y2_MAP = {
+    0.70: 3.0,   
+    0.80: 2.0,   
+    0.90: 1.0,   
+    0.95: 0.5,   
+}
+
+cmd_state = {
+    "vx": 0.0,
+    "vy": 0.0,
+    "vyaw": 0.0,
+    "last_update": 0.0
+}
+
+class GuardState:
+    IDLE = "idle"
+    WATCHING = "watching"
+    BARKING = "barking"
+    RETREATING = "retreating"
+
+bark_event = threading.Event()
+
+# ==========================================
+# 1. 守护线程：独立音频服务 (完美兼容阻塞式 SDK)
+# ==========================================
+'''
+def audio_worker_thread():
+    print("🟢 [音频线程] 真声扬声器服务已就绪...")
+    while True:
+        if bark_event.is_set():
+            # 核心黑科技：屏蔽 play.py 里的 print，防止刷屏破坏 UI 界面
+            try:
+                with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f):
+                    play_sound(SOUND_PATH)
+            except Exception as e:
+                print(f"\n❌ 播放失败: {e}")
+            
+            time.sleep(BARK_INTERVAL)
+            bark_event.clear()
+        else:
+            time.sleep(0.05) 
+'''
+def audio_worker_thread():
+    print("🟢 [音频线程] 真声扬声器服务已就绪...")
+    while True:
+        if bark_event.is_set():
+            print("\n\n👇 --- 正在调用底层音频流 --- 👇")
+            try:
+                # 撕下伪装，让 play.py 畅所欲言
+                play_sound(SOUND_PATH)
+            except Exception as e:
+                print(f"❌ 播放抛出异常: {e}")
+            print("👆 --- 音频流调用结束 --- 👆\n")
+            
+            time.sleep(BARK_INTERVAL)
+            bark_event.clear()
+        else:
+            time.sleep(0.05)
+
+
+# ==========================================
+# 2. 守护线程：平滑运动控制
+# ==========================================
+def control_thread_task(sport_client):
+    print("🟢 [控制线程] 20Hz 柔性底盘控制已启动...")
+    real_vx, real_vyaw = 0.0, 0.0
+    
+    try:
+        while True:
+            if time.time() - cmd_state["last_update"] > CMD_TIMEOUT:
+                target_vx, target_vy, target_vyaw = 0.0, 0.0, 0.0
+            else:
+                target_vx = cmd_state["vx"]
+                target_vy = cmd_state["vy"]
+                target_vyaw = cmd_state["vyaw"]
+
+            real_vx += SMOOTH_FACTOR * (target_vx - real_vx)
+            real_vyaw += SMOOTH_FACTOR * (target_vyaw - real_vyaw)
+
+            if abs(real_vx) < 0.02: real_vx = 0.0
+            if abs(real_vyaw) < 0.05: real_vyaw = 0.0
+
+            if real_vx == 0.0 and target_vy == 0.0 and real_vyaw == 0.0:
+                sport_client.StopMove()
+            else:
+                sport_client.Move(real_vx, target_vy, real_vyaw)
+            
+            time.sleep(0.05)
+    except Exception as e:
+        print(f"❌ [控制线程] 异常: {e}")
+    finally:
+        sport_client.StopMove()
+
+def estimate_distance_from_y2(y2_pos):
+    y2_points = sorted(DISTANCE_Y2_MAP.keys())
+    dist_points = [DISTANCE_Y2_MAP[y] for y in y2_points]
+    
+    if y2_pos <= y2_points[0]: return dist_points[0]
+    if y2_pos >= y2_points[-1]: return dist_points[-1]
+    
+    for i in range(len(y2_points) - 1):
+        if y2_points[i] <= y2_pos <= y2_points[i + 1]:
+            ratio = (y2_pos - y2_points[i]) / (y2_points[i + 1] - y2_points[i])
+            return dist_points[i] + ratio * (dist_points[i + 1] - dist_points[i])
+    return dist_points[-1]
+
+# ==========================================
+# 主程序：感知与决策大脑
+# ==========================================
+def main():
+    parser = argparse.ArgumentParser(description="Go2 Guard Dog V2 - 满血真声版")
+    parser.add_argument("--test", action="store_true", help="测试模式 (不移动)")
+    args = parser.parse_args()
+
+    print("=" * 50)
+    print("🐕 Go2 Guard Dog V2 - 视线追踪 + 真实咆哮启动")
+    print("=" * 50)
+
+    # 验证音频文件是否存在
+    if not os.path.exists(SOUND_PATH):
+        print(f"❌ 找不到狗叫声音频: {SOUND_PATH}")
+        print("💡 提示: 请先下载一个 dog_barking.wav 放进 go2-audio-play/sounds/ 目录！")
+        sys.exit(1)
+
+    ChannelFactoryInitialize(0, NETWORK_INTERFACE)
+    
+    video_client = VideoClient()
+    video_client.SetTimeout(3.0)
+    video_client.Init()
+
+    sport_client = None
+    if not args.test:
+        sport_client = SportClient()
+        sport_client.SetTimeout(3.0)
+        sport_client.Init()
+
+    print("🚀 正在加载 YOLO BoT-SORT 追踪器...")
+    model = YOLO(MODEL_PATH)
+    model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+
+    threading.Thread(target=audio_worker_thread, daemon=True).start()
+    if sport_client:
+        threading.Thread(target=control_thread_task, args=(sport_client,), daemon=True).start()
+
+    print("\n🛡️ 区域防守已激活！准备好你的声音，按 Ctrl+C 停止。\n")
+
+    current_state = GuardState.IDLE
+    last_print_time = 0.0
+
+    try:
+        while True:
+            code, data = video_client.GetImageSample()
+            if code != 0:
+                time.sleep(0.01)
+                continue
+            
+            np_arr = np.frombuffer(bytes(data), np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if img is None: continue
+
+            results = model.track(img, classes=[0], conf=0.45, persist=True, tracker="botsort.yaml", verbose=False)
+            
+            person_detected = False
+            target_h_pos, target_y2 = 0.0, 0.0
+            
+            if results[0].boxes.id is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                max_area = 0
+                
+                for box in boxes:
+                    x1, y1, x2, y2 = box
+                    area = (x2 - x1) * (y2 - y1)
+                    if area > max_area:
+                        max_area = area
+                        person_detected = True
+                        target_h_pos = ((x1 + x2) / (2 * img.shape[1]) - 0.5) * 2
+                        target_y2 = y2 / img.shape[0]
+
+            # --- 决策大脑 (增加姿态逻辑) ---
+            new_vx, new_vyaw = 0.0, 0.0
+            target_pitch = 0.0
+            target_height = 0.0
+            
+            if person_detected:
+                distance = estimate_distance_from_y2(target_y2)
+                # 依然保持盯防
+                new_vyaw = -target_h_pos * 1.5
+                new_vyaw = max(-0.8, min(0.8, new_vyaw))
+
+                if distance > WARN_DISTANCE:
+                    new_state = GuardState.WATCHING
+                    action_desc = "眼神盯防"
+                elif distance > DANGER_DISTANCE:
+                    new_state = GuardState.BARKING
+                    action_desc = "压低身体警告"
+                    bark_event.set()
+                    # 关键修改：进入警告距离，压低身体并前倾
+                    target_pitch = POUNCE_PITCH
+                    target_height = LOW_HEIGHT
+                else:
+                    new_state = GuardState.RETREATING
+                    action_desc = "战术后退"
+                    new_vx = RETREAT_SPEED 
+                    bark_event.set()
+                    # 后退时依然保持压低姿态，增加压迫感
+                    target_pitch = POUNCE_PITCH
+                    target_height = LOW_HEIGHT
+
+            else:
+                new_state = GuardState.IDLE
+                action_desc = "平安无事"
+
+            if not args.test:
+                cmd_state["vx"] = new_vx
+                cmd_state["vy"] = 0.0
+                cmd_state["vyaw"] = new_vyaw
+                cmd_state["last_update"] = time.time()
+
+            if new_state != current_state or time.time() - last_print_time > 1.0:
+                current_state = new_state
+                last_print_time = time.time()
+                
+                emoji = {"idle":"😌", "watching":"👀", "barking":"🔊", "retreating":"🚨"}
+                if person_detected:
+                    print(f"\r\033[K{emoji[new_state]} [距 {distance:.1f}m] | 动作: {action_desc} (vx:{new_vx:.2f}, vyaw:{new_vyaw:.2f})", end="", flush=True)
+                else:
+                    print(f"\r\033[K{emoji[new_state]} 视野清晰，无人靠近...", end="", flush=True)
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 接收到退出信号，正在关门放狗...")
+        if sport_client:
+            cmd_state["vx"], cmd_state["vyaw"] = 0.0, 0.0
+            time.sleep(0.3)
+            sport_client.StopMove()
+        print("✅ 系统已安全退出。")
+
+if __name__ == "__main__":
+    main()
+
+
+
+'''
+            new_vx, new_vyaw = 0.0, 0.0
+            distance = float('inf')
+            
+            if person_detected:
+                distance = estimate_distance_from_y2(target_y2)
+                new_vyaw = -target_h_pos * 1.5
+                new_vyaw = max(-0.8, min(0.8, new_vyaw))
+
+                if distance > WARN_DISTANCE:
+                    new_state = GuardState.WATCHING
+                    action_desc = "眼神盯防"
+                elif distance > DANGER_DISTANCE:
+                    new_state = GuardState.BARKING
+                    action_desc = "汪汪警告"
+                    bark_event.set() # 发出真狗叫
+                else:
+                    new_state = GuardState.RETREATING
+                    action_desc = "战术后退"
+                    new_vx = RETREAT_SPEED 
+                    bark_event.set() # 发出真狗叫
+'''

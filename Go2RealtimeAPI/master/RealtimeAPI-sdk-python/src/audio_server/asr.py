@@ -120,7 +120,11 @@ class Qwen3ASR:
                     )
                 
                 if response.status_code == 200:
-                    text = response["output"]["choices"][0]["message"].content[0]["text"]
+                    choices = response.get("output", {}).get("choices", [])
+                    if choices:
+                        content = choices[0].get("message", {}).content
+                        if content and len(content) > 0:
+                            text = content[0].get("text", "")
                     break
                 else:
                     retry_num -= 1
