@@ -18,7 +18,7 @@ from unitree_sdk2py.go2.sport.sport_client import SportClient
 # 配置参数
 # ==========================================
 NETWORK_INTERFACE = sys.argv[1] if len(sys.argv) > 1 else "eth0"
-MODEL_PATH = '/home/unitree/openclaw/skills/unitree-go2/yolov8n.pt'
+MODEL_PATH = '/home/unitree/RealVLN/openclaw/skills/unitree-go2/yolov8n.pt'
 
 # 视觉死区阈值（可根据实际灵敏度微调）
 CENTER_THRESHOLD = 0.15     

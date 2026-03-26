@@ -63,7 +63,7 @@ python3 scripts/guard_dog.py --help
 ```yaml
 # 启动看家模式
 exec:
-  command: python3 /home/unitree/openclaw/skills/go2-guard-dog/scripts/guard_dog.py
+  command: python3 /home/unitree/RealVLN/openclaw/skills/go2-guard-dog/scripts/guard_dog.py
 ```
 
 ## 参数配置

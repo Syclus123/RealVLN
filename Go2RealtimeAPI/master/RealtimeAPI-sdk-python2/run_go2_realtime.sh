@@ -48,9 +48,20 @@ sync_deps() {
     uv sync
 }
 
+# 清理日志文件
+clean_logs() {
+    info "清理旧的日志文件..."
+    # 清空 navigation.jsonl，如果文件不存在会自动创建空文件
+    mkdir -p "nav_logs"
+    > "nav_logs/navigation.jsonl"
+    # 删除旧的日志文件
+    rm -f audio_client.log main_client.log
+}
+
 # 主流程
 check_uv
 sync_deps
+clean_logs
 info "启动语音通话客户端Go2..."
 echo ""
 

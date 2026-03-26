@@ -35,14 +35,14 @@ ACTION_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "balance_stand",
+            "name": "balance",
             "description": "平衡站立",
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "recovery_stand",
+            "name": "recovery",
             "description": "恢复站立(摔倒后起立)",
         }
     },
@@ -99,31 +99,14 @@ ACTION_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "move_left",
-            "description": "左平移",
+            "name": "move_lateral",
+            "description": "横向移动/左平移/右平移",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "speed": {
                         "type": "number",
-                        "description": "左平移速度，范围 0.0~0.5，默认 0.3"
-                    }
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "move_right",
-            "description": "右平移",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "speed": {
-                        "type": "number",
-                        "description": "右平移速度，范围 0.0~0.5，默认 0.3"
+                        "description": "横向移动速度，范围 0.0~0.5，默认 0.3"
                     }
                 },
                 "required": []
@@ -192,7 +175,7 @@ ACTION_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "hand_stand",
+            "name": "handstand",
             "description": "倒立",
             "parameters": {
                 "type": "object",
@@ -291,6 +274,29 @@ ACTION_TOOLS = [
             }
         }
     },
+
+    # ==================== 社交/表情 ====================
+    {
+        "type": "function",
+        "function": {
+            "name": "sit",
+            "description": "坐下",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hello",
+            "description": "打招呼/挥手",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stretch",
+            "description": "伸展/伸懒腰",
+        }
+    },
 ]
 
 GO2_TOOLS = [
@@ -322,4 +328,4 @@ GO2_TOOLS = [
     },
 ]
 
-# GO2_TOOLS.extend(ACTION_TOOLS)
+GO2_TOOLS.extend(ACTION_TOOLS)

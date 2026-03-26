@@ -18,7 +18,7 @@ from unitree_sdk2py.go2.video.video_client import VideoClient
 from unitree_sdk2py.go2.sport.sport_client import SportClient
 
 # 动态导入语音技能
-sys.path.insert(0, '/home/unitree/openclaw/skills/go2-audio-play/scripts')
+sys.path.insert(0, '/home/unitree/RealVLN/openclaw/skills/go2-audio-play/scripts')
 from play import play_sound
 
 logger = logging.getLogger("guard_dog")
@@ -36,8 +36,8 @@ class _PipeLogHandler(logging.Handler):
 # ==========================================
 # 核心配置与阈值
 # ==========================================
-MODEL_PATH = '/home/unitree/openclaw/skills/unitree-go2/yolov8n.pt'
-SOUND_PATH = '/home/unitree/openclaw/skills/go2-audio-play/sounds/dog_barking.wav'
+MODEL_PATH = '/home/unitree/RealVLN/openclaw/skills/unitree-go2/yolov8n.pt'
+SOUND_PATH = '/home/unitree/RealVLN/openclaw/skills/go2-audio-play/sounds/dog_barking.wav'
 
 WARN_DISTANCE = 2.0
 DANGER_DISTANCE = 1.0

@@ -46,7 +46,7 @@ python3 scripts/follow_person.py --duration 30
 ```yaml
 # 启动自动跟随
 exec:
-  command: python3 /home/unitree/openclaw/skills/go2-follow-person/scripts/follow_person.py
+  command: python3 /home/unitree/RealVLN/openclaw/skills/go2-follow-person/scripts/follow_person.py
 ```
 
 ## 参数配置

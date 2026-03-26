@@ -65,6 +65,9 @@ from audio_client import (
 from .intentllm import QwenLLM, call_llm_api
 from .vlm import QwenVLM, call_vlm_api
 from .tts_client import TencentTTS
+from .functions import ACTION_TOOLS
+
+ACTION_FUNC_NAMES = {t["function"]["name"] for t in ACTION_TOOLS}
 
 try:
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -597,39 +600,59 @@ MULTI_TASK_TOOLS = [
         "function": {
             "name": "stop_task",
             "description": "停止当前正在执行的后台任务（如跟随、看门、声源定位等），"
-                           "当用户说停下来、别跟了、取消任务、停止时调用。",
+                           "当用户说别跟了、取消任务时调用。注意：如果没有后台任务运行，"
+                           "用户说'停'或'停下来'应调用动作控制的 stop 工具而不是此工具。",
         },
     },
 ]
 
+MULTI_TASK_TOOLS.extend(ACTION_TOOLS)
+
 intent_llm_system_prompt = '''
-你是一个搭载了视觉感知、移动导航和智能任务模块的智能机器狗。你必须将用户的每一句话解析为对应的工具调用，不能输出任何工具调用之外的自然语言废话。
+你是一个搭载了视觉感知、移动导航、动作控制和智能任务模块的智能机器狗。你必须将用户的每一句话解析为对应的工具调用，不能输出任何工具调用之外的自然语言废话。
 
 你拥有以下工具：
-1. 【nav (导航与寻物)】：负责空间移动、带路、寻找物品的位置。（关键词：去、找、带我到、哪儿）
-2. 【vqa (视觉问答)】：负责分析当前视野内的图像，识别眼前物品。（关键词：这是什么、看看、描述眼前）
-3. 【chat (闲聊与百科)】：负责日常寒暄、情感交流、回答通用百科知识。（场景：不需要移动、不需要看图的纯对话）
-4. 【follow_person (跟随)】：跟随用户移动。（关键词：跟着我、跟上来、跟我走）
-5. 【guard_dog (看门狗)】：进入巡逻看守模式。（关键词：看门、守着、巡逻、站岗）
-6. 【audio_track (声源定位)】：定位声音来源方向并转向。（关键词：声音从哪来、听听、定位声源、哪个方向的声音）
-7. 【stop_task (停止任务)】：停止正在执行的后台任务。（关键词：停下来、别跟了、取消任务、停止）
+1. 【动作控制工具】：负责机器狗的即时动作控制，包括站立(stand_up)、趴下(stand_down)、平衡站立(balance)、恢复站立(recovery)、阻尼模式(damp)、停止(stop)、向前走(move_forward)、后退(move_backward)、横向移动(move_lateral)、左转(turn_left)、右转(turn_right)、左空翻(left_flip)、后空翻(back_flip)、自由行走(free_walk)、倒立(handstand)、跳跃(free_jump)、蹦跳(free_bound)、自动避障(free_avoid)、直立行走(walk_upright)、交叉步(cross_step)、坐下(sit)、打招呼(hello)、伸展(stretch)。当用户要求机器狗执行具体动作时，直接调用对应的动作工具。
+2. 【nav (导航与寻物)】：负责空间移动到具体目的地、带路、寻找物品的位置。（关键词：去某个地方、找某个东西、带我到、哪儿）
+3. 【vqa (视觉问答)】：负责分析当前视野内的图像，识别眼前物品。（关键词：这是什么、看看、描述眼前）
+4. 【chat (闲聊与百科)】：负责日常寒暄、情感交流、回答通用百科知识。（场景：不需要移动、不需要看图的纯对话）
+5. 【follow_person (跟随)】：跟随用户移动。（关键词：跟着我、跟上来、跟我走）
+6. 【guard_dog (看门狗)】：进入巡逻看守模式。（关键词：看门、守着、巡逻、站岗）
+7. 【audio_track (声源定位)】：定位声音来源方向并转向。（关键词：声音从哪来、听听、定位声源、哪个方向的声音）
+8. 【stop_task (停止后台任务)】：停止正在执行的后台任务（如跟随、看门、声源定位）。（关键词：别跟了、取消任务）
+
+【动作控制 vs 导航的区别】（非常重要！）
+- 动作控制：用户要求的是"立即执行一个动作"，没有具体的目的地。例如"向前走"、"停下来"、"趴下"、"翻个跟头"。
+- 导航：用户要求的是"去某个地方"或"找某个东西"，有明确的目标地点或物品。例如"去客厅"、"帮我找水杯"。
 
 【意图判断与边界划分】（重要！）
+- 用户："向前走" -> 即时动作，调用 `move_forward`。
+- 用户："停下来" -> 即时动作，调用 `stop`。
+- 用户："趴下" -> 即时动作，调用 `stand_down`。
+- 用户："翻个跟头" -> 即时动作，调用 `back_flip`。
+- 用户："左转" -> 即时动作，调用 `turn_left`。
+- 用户："站起来" -> 即时动作，调用 `stand_up`。
+- 用户："跳一个" -> 即时动作，调用 `free_jump`。
 - 用户："我的可乐在哪儿？" -> 寻找实体位置，调用 `nav`。
 - 用户："我手里这瓶可乐过期了吗？" -> 需要查看眼前画面，调用 `vqa`。
 - 用户："可乐是谁发明的？" -> 通用知识百科，调用 `chat`。
-- 用户："今天天气真好，带我去阳台。" -> 包含移动意图，调用 `nav`。
+- 用户："今天天气真好，带我去阳台。" -> 去具体目的地，调用 `nav`。
 - 用户："你好啊，笨笨。" -> 日常打招呼，调用 `chat`。
 - 用户："跟着我走。" -> 跟随用户，调用 `follow_person`。
 - 用户："帮我看着门。" -> 看守模式，调用 `guard_dog`。
 - 用户："声音从哪来的？" -> 声源定位，调用 `audio_track`。
-- 用户："别跟了，停下来。" -> 停止后台任务，调用 `stop_task`。
+- 用户："别跟了。" -> 停止后台任务，调用 `stop_task`。
 
 【分类防错指南】
+请小心区分"动作控制"和"导航"：
+- 问："向前走" -> 没有目的地，属于即时动作控制，调用 `move_forward`。
+- 问："往前走到客厅" -> 有目的地"客厅"，属于导航，调用 `nav`。
+- 问："停" -> 即时动作控制，调用 `stop`。
+- 问："帮我找个苹果吃。" -> 需要寻找位置，调用 `nav`。
+
 请小心区分"眼前实体问答"和"通用知识问答"：
 - 问："苹果的营养价值是什么？" -> 属于通用百科，调用 `chat`。
 - 问："桌子上的苹果红了吗？" -> 针对眼前具体的苹果，调用 `vqa`。
-- 问："帮我找个苹果吃。" -> 需要寻找位置，调用 `nav`。
 - 问："你叫什么名字？" -> 闲聊，调用 `chat`。
 '''
 
@@ -819,6 +842,7 @@ class PartialIntentPredictor:
         self._debounce_task: Optional[asyncio.Task] = None
         self._predict_task: Optional[asyncio.Task] = None
         self._detected_intent: Optional[str] = None
+        self._last_tool_call: Optional[dict] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._on_intent_callback: Optional[Callable[[str], None]] = None
 
@@ -834,6 +858,11 @@ class PartialIntentPredictor:
             return self._detected_intent
 
     @property
+    def last_tool_call(self) -> Optional[dict]:
+        with self._lock:
+            return self._last_tool_call
+
+    @property
     def is_local_intent(self) -> bool:
         with self._lock:
             return (self._detected_intent is not None
@@ -843,6 +872,7 @@ class PartialIntentPredictor:
         with self._lock:
             self._version += 1
             self._detected_intent = None
+            self._last_tool_call = None
             self._last_submitted_text = ""
         if self._debounce_task and not self._debounce_task.done():
             self._debounce_task.cancel()
@@ -903,6 +933,7 @@ class PartialIntentPredictor:
             with self._lock:
                 if version != self._version:
                     return
+                self._last_tool_call = tool_call
             intent = self._parse_intent(result_text, tool_call)
             if intent:
                 with self._lock:
@@ -1199,6 +1230,7 @@ class IntentEventHandler(EventHandler):
         self._already_decided = False
         self._already_cancelled = False
         self._decided_intent: Optional[str] = None
+        self._partial_control_func: str = ""
         self._pending_final_text: Optional[str] = None
         self._current_inline_task: Optional[asyncio.Task] = None
 
@@ -1233,6 +1265,8 @@ class IntentEventHandler(EventHandler):
             self._handle_passthrough()
         elif intent_name == "stop_task":
             self._handle_stop_task()
+        elif intent_name in ACTION_FUNC_NAMES:
+            self._handle_control_intent(intent_name)
         else:
             self._handle_local_intent(intent_name)
 
@@ -1295,6 +1329,75 @@ class IntentEventHandler(EventHandler):
             text = self._pending_final_text
             self._pending_final_text = None
             self._run_async_nowait(self._execute_intent(intent_name, text))
+
+    def _handle_control_intent(self, func_name: str):
+        """
+        动作控制意图 → 立即 cancel_response + 写 control log + TTS 反馈。
+        与 nav 类似：立即止损，将动作函数名写入 navigation.jsonl。
+        """
+        tool_call = self._partial_predictor.last_tool_call if self._partial_predictor else None
+        func_args = {}
+        if tool_call:
+            args_str = tool_call.get("function", {}).get("arguments", "")
+            if args_str and isinstance(args_str, str):
+                try:
+                    func_args = json.loads(args_str)
+                except Exception:
+                    func_args = {}
+            elif isinstance(args_str, dict):
+                func_args = args_str
+
+        logger.info(f"🎮 Partial=CONTROL → 动作: {func_name}, 参数: {func_args}")
+
+        self._already_decided = True
+        self._already_cancelled = True
+        self._decided_intent = func_name
+        self._partial_control_func = func_name
+        self._audio_gate.decide_discard()
+
+        if self._client:
+            self._client.cancel_response()
+
+        with self._buffer_lock:
+            current_text = self._user_text_buffer.strip()
+
+        if self._pending_final_text:
+            self._run_async_nowait(
+                self._write_control_log(func_name, self._pending_final_text, func_args)
+            )
+            self._pending_final_text = None
+
+        if self._coordinator:
+            action_desc = self._get_action_description(func_name)
+            tts = f"好的，正在执行{action_desc}。"
+            self._run_async_nowait(
+                self._coordinator._queue.put(PlaybackTask(
+                    priority=2, text=tts,
+                    source=PlaybackSource.TASK_FEEDBACK,
+                    conflict_policy=ConflictPolicy.INTERRUPT,
+                    metadata={"action": func_name, "original_text": current_text,
+                              "trigger": "partial_control"},
+                ))
+            )
+            logger.info(f"🎮 TTS 已入队 (partial control): action=\"{func_name}\"")
+
+    @staticmethod
+    def _get_action_description(func_name: str) -> str:
+        _ACTION_DESC = {
+            "stand_up": "站立", "stand_down": "趴下",
+            "balance": "平衡站立", "recovery": "恢复站立",
+            "damp": "关节放松", "stop": "停止",
+            "move_forward": "向前走", "move_backward": "后退",
+            "move_lateral": "横向移动",
+            "turn_left": "左转", "turn_right": "右转",
+            "left_flip": "左空翻", "back_flip": "后空翻",
+            "free_walk": "自由行走", "handstand": "倒立",
+            "free_jump": "跳跃", "free_bound": "蹦跳",
+            "free_avoid": "自动避障", "walk_upright": "直立行走",
+            "cross_step": "交叉步",
+            "sit": "坐下", "hello": "打招呼", "stretch": "伸展",
+        }
+        return _ACTION_DESC.get(func_name, func_name)
 
     # ─────────────────────────────────────────
     #  意图执行
@@ -1423,6 +1526,7 @@ class IntentEventHandler(EventHandler):
         self._already_decided = False
         self._already_cancelled = False
         self._decided_intent = None
+        self._partial_control_func = ""
         self._pending_final_text = None
 
         # 取消当前 inline 任务 (不影响后台脚本任务)
@@ -1533,6 +1637,30 @@ class IntentEventHandler(EventHandler):
             logger.info("✅ stop_task 已执行, 跳过")
             return
 
+        # ═══ 已决策 = CONTROL (partial 已 cancel + TTS) ═══
+        if self._already_cancelled and self._partial_control_func:
+            if self._partial_predictor:
+                self._partial_predictor.cancel_pending()
+            logger.info(
+                f"✅ partial=CONTROL 已处理, 跳过 | action=\"{self._partial_control_func}\""
+            )
+            if full_text:
+                tool_call = self._partial_predictor.last_tool_call if self._partial_predictor else None
+                func_args = {}
+                if tool_call:
+                    args_str = tool_call.get("function", {}).get("arguments", "")
+                    if args_str and isinstance(args_str, str):
+                        try:
+                            func_args = json.loads(args_str)
+                        except Exception:
+                            func_args = {}
+                    elif isinstance(args_str, dict):
+                        func_args = args_str
+                self._run_async_nowait(
+                    self._write_control_log(self._partial_control_func, full_text, func_args)
+                )
+            return
+
         # ═══ 已决策 = 其他 local intent → 执行 ═══
         if self._already_cancelled and self._decided_intent:
             if self._partial_predictor:
@@ -1601,6 +1729,21 @@ class IntentEventHandler(EventHandler):
                 "destination": dest,
                 "original_text": text,
             }, ensure_ascii=False) + "\n")
+
+    async def _write_control_log(self, func_name, text, func_args=None):
+        d = Path("./nav_logs")
+        d.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "control",
+            "destination": func_name,
+            "original_text": func_name,
+        }
+        if func_args:
+            record["parameters"] = func_args
+        async with aiofiles.open(d / "navigation.jsonl", "a", encoding="utf-8") as f:
+            await f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info(f"📝 Control log 已写入: {func_name}")
 
     # ─────────────────────────────────────────
     #  其他事件
